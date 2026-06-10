@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+import datetime as _dt
+import os
+import sqlite3
+import subprocess
+import sys
+from email.message import EmailMessage
+from html import escape
+from pathlib import Path
+
+BASE = Path(os.environ.get("SMS_BASE", "/htdocs/sms"))
+DATA = BASE / "data"
+CONF = BASE / "conf"
+LOGS = BASE / "logs"
+DB = DATA / "sms.sqlite"
+LOG = LOGS / "sms-forward.log"
+MAIL_ENV = CONF / "sms-forward-mail.env"
+MSMTPRC = CONF / "msmtprc"
+
+
+def env_int(name: str) -> int:
+    try:
+        return int(os.environ.get(name, "0") or "0")
+    except ValueError:
+        return 0
+
+
+def sms_text() -> str:
+    text = os.environ.get("DECODED_1_TEXT") or os.environ.get("SMS_1_TEXT") or ""
+    if text:
+        return text
+    parts = []
+    for idx in range(1, env_int("SMS_MESSAGES") + 1):
+        part = os.environ.get(f"SMS_{idx}_TEXT", "")
+        if part:
+            parts.append(part)
+    return "".join(parts)
+
+
+def load_env(path: Path) -> dict:
+    values = {}
+    if not path.exists():
+        return values
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        values[key] = value
+    return values
+
+
+def ensure_schema() -> None:
+    DATA.mkdir(parents=True, exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbound_sms (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              received_at TEXT NOT NULL,
+              sender TEXT NOT NULL DEFAULT '',
+              text TEXT NOT NULL DEFAULT '',
+              raw_ids TEXT NOT NULL DEFAULT '',
+              phone_id TEXT NOT NULL DEFAULT '',
+              sms_messages INTEGER NOT NULL DEFAULT 0,
+              decoded_parts INTEGER NOT NULL DEFAULT 0,
+              forwarded INTEGER NOT NULL DEFAULT 0,
+              forward_error TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_sms_received_at ON inbound_sms(received_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_sms_sender ON inbound_sms(sender)")
+
+
+def insert_sms(received_at: str, sender: str, text: str, raw_ids: str, phone_id: str, sms_messages: int, decoded_parts: int) -> int:
+    with sqlite3.connect(DB) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO inbound_sms
+              (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded, forward_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, '')
+            """,
+            (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts),
+        )
+        return int(cur.lastrowid)
+
+
+def update_forward_status(record_id: int, forwarded: int, forward_error: str) -> None:
+    with sqlite3.connect(DB) as conn:
+        conn.execute(
+            "UPDATE inbound_sms SET forwarded = ?, forward_error = ? WHERE id = ?",
+            (forwarded, forward_error, record_id),
+        )
+
+
+def build_plain(record_id: int, sender: str, text: str, received_at: str, raw_ids: str, phone_id: str) -> str:
+    return (
+        "新短信通知\n\n"
+        f"记录 ID: #{record_id}\n"
+        f"接收时间: {received_at}\n"
+        f"发送号码: {sender}\n"
+        f"模块标识: {phone_id or '-'}\n"
+        f"消息文件: {raw_ids or '-'}\n\n"
+        "短信内容:\n"
+        f"{text or '(空短信)'}\n"
+    )
+
+
+def build_html(record_id: int, sender: str, text: str, received_at: str, raw_ids: str, phone_id: str) -> str:
+    safe_sender = escape(sender or "unknown")
+    safe_time = escape(received_at)
+    safe_text = escape(text or "(空短信)")
+    safe_ids = escape(raw_ids or "-")
+    safe_phone = escape(phone_id or "-")
+    preview = escape((text or "空短信").replace("\n", " ")[:120])
+    return f"""<!doctype html>
+<html lang="zh-CN">
+  <body style="margin:0;padding:0;background:#f4f6f8;color:#17202a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',Arial,sans-serif;">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;">来自 {safe_sender}: {preview}</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f6f8;margin:0;padding:24px 12px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border:1px solid #d9e0e8;border-radius:8px;overflow:hidden;">
+            <tr>
+              <td style="background:#1f6feb;color:#ffffff;padding:22px 24px;">
+                <div style="font-size:13px;line-height:18px;opacity:.9;">SMS Gateway</div>
+                <div style="font-size:22px;line-height:30px;font-weight:700;margin-top:4px;">新短信通知</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:22px 24px 8px 24px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:14px;line-height:22px;">
+                  <tr>
+                    <td style="width:92px;color:#667085;padding:7px 0;border-bottom:1px solid #edf1f5;">发送号码</td>
+                    <td style="color:#101828;font-weight:700;padding:7px 0;border-bottom:1px solid #edf1f5;word-break:break-all;">{safe_sender}</td>
+                  </tr>
+                  <tr>
+                    <td style="color:#667085;padding:7px 0;border-bottom:1px solid #edf1f5;">接收时间</td>
+                    <td style="color:#101828;padding:7px 0;border-bottom:1px solid #edf1f5;">{safe_time}</td>
+                  </tr>
+                  <tr>
+                    <td style="color:#667085;padding:7px 0;border-bottom:1px solid #edf1f5;">记录 ID</td>
+                    <td style="color:#101828;padding:7px 0;border-bottom:1px solid #edf1f5;">#{record_id}</td>
+                  </tr>
+                  <tr>
+                    <td style="color:#667085;padding:7px 0;border-bottom:1px solid #edf1f5;">模块标识</td>
+                    <td style="color:#101828;padding:7px 0;border-bottom:1px solid #edf1f5;">{safe_phone}</td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:14px 24px 24px 24px;">
+                <div style="font-size:13px;line-height:18px;color:#667085;margin-bottom:8px;">短信内容</div>
+                <div style="font-size:18px;line-height:30px;color:#101828;background:#f8fafc;border:1px solid #e4e9f0;border-radius:8px;padding:16px;white-space:pre-wrap;word-break:break-word;">{safe_text}</div>
+                <div style="font-size:12px;line-height:18px;color:#98a2b3;margin-top:16px;word-break:break-all;">消息文件: {safe_ids}</div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+
+
+def send_mail(record_id: int, sender: str, text: str, received_at: str, raw_ids: str, phone_id: str) -> tuple[int, str]:
+    cfg = load_env(MAIL_ENV)
+    to_addr = cfg.get("SMS_FORWARD_TO", "")
+    if not to_addr:
+        return 0, ""
+
+    from_addr = cfg.get("SMS_FORWARD_FROM", "sms-gateway@localhost")
+    msg = EmailMessage()
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg["Subject"] = f"新短信提醒 #{record_id} - {sender}"
+    msg.set_content(build_plain(record_id, sender, text, received_at, raw_ids, phone_id), charset="utf-8")
+    msg.add_alternative(build_html(record_id, sender, text, received_at, raw_ids, phone_id), subtype="html", charset="utf-8")
+
+    if MSMTPRC.exists():
+        cmd = ["/usr/bin/msmtp", "-C", str(MSMTPRC), "-t"]
+    else:
+        cmd = ["/usr/sbin/sendmail", "-t"]
+    try:
+        subprocess.run(cmd, input=msg.as_bytes(), timeout=30, check=True)
+        return 1, ""
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def main() -> int:
+    ensure_schema()
+    received_at = _dt.datetime.now().astimezone().strftime("%F %T %z")
+    sender = os.environ.get("SMS_1_NUMBER", "unknown")
+    text = sms_text()
+    raw_ids = " ".join(sys.argv[1:])
+    phone_id = os.environ.get("PHONE_ID", "")
+    sms_messages = env_int("SMS_MESSAGES")
+    decoded_parts = env_int("DECODED_PARTS")
+
+    record_id = insert_sms(received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts)
+    forwarded, forward_error = send_mail(record_id, sender, text, received_at, raw_ids, phone_id)
+    update_forward_status(record_id, forwarded, forward_error)
+
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write(f"{received_at} id={record_id} from={sender} ids={raw_ids} forwarded={forwarded} text={text}\n")
+        if forward_error:
+            fh.write(f"{received_at} id={record_id} forward_error={forward_error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
