@@ -62,7 +62,7 @@ DEFAULT_STRATEGY = {
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S %z"
 SEND_INTERVAL_MAX_MINUTES = 180 * 24 * 60
 RETRY_INTERVAL_MAX_MINUTES = 10080
-SIM_STATUS_CACHE_SECONDS = 60
+SIM_STATUS_STREAM_SECONDS = 60
 
 
 def now_text() -> str:
@@ -452,15 +452,47 @@ def send_type_badge(send_type: str) -> str:
     return f'<span class="badge {tone}">{html.escape(label)}</span>'
 
 
+def describe_sim_state(imsi: str = "", seen_status: bool = False) -> str:
+    if imsi:
+        return "已识别（IMSI 可用）"
+    if seen_status:
+        return "未识别（无 IMSI）"
+    return "状态未知"
+
+
+def describe_network_switch(signal: str = "", network_level: str = "", network_state: str = "") -> tuple[str, str]:
+    # This SMS gateway must keep mobile data disabled; signal/registration is not data usage.
+    return "数据关闭", "ok"
+
+
+def mask_sim_identity(imsi: str = "") -> str:
+    digits = "".join(ch for ch in imsi if ch.isdigit())
+    if len(digits) < 10:
+        return ""
+    return f"{digits[:5]}******{digits[-4:]}"
+
+
+def format_sms_counts(sent: str = "", received: str = "", failed: str = "") -> str:
+    if not (sent or received or failed):
+        return ""
+    return f"已发 {sent or '0'} / 已收 {received or '0'} / 失败 {failed or '0'}"
+
+
 def parse_sim_status_output(output: str) -> dict:
     info = {
-        "sim_state": "未知",
+        "sim_state": "状态未知",
+        "sim_identity": "",
+        "sms_counts": "",
         "signal": "",
         "network_level": "",
         "network_state": "",
+        "network_switch": "未知",
+        "network_switch_tone": "muted",
         "operator": "",
         "error": "",
     }
+    imsi = ""
+    network_code = ""
     for raw in output.splitlines():
         if ":" not in raw:
             continue
@@ -477,69 +509,129 @@ def parse_sim_status_output(output: str) -> dict:
             info["network_state"] = value
         elif key == "name in phone":
             info["operator"] = value
-        elif key == "network" and not info["operator"]:
-            info["operator"] = value
+        elif key == "network":
+            network_code = value
         elif key == "sim imsi":
-            info["sim_state"] = "已识别"
+            imsi = value
+    info["sim_state"] = describe_sim_state(imsi, bool(output.strip()))
+    info["sim_identity"] = mask_sim_identity(imsi)
+    switch, switch_tone = describe_network_switch(info["signal"], info["network_level"], info["network_state"])
+    info["network_switch"] = switch
+    info["network_switch_tone"] = switch_tone
+    if not info["operator"]:
+        info["operator"] = infer_operator(network_code, imsi) or network_code
     return info
 
 
-def read_smsd_phone_status() -> dict | None:
-    if not GAMMU_DB.exists():
-        return None
-    try:
-        conn = sqlite3.connect(GAMMU_DB, timeout=5)
-        conn.row_factory = sqlite3.Row
-        with conn:
-            row = conn.execute("SELECT * FROM phones ORDER BY UpdatedInDB DESC LIMIT 1").fetchone()
-    except Exception:
-        return None
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    if not row:
-        return None
-    signal = int(row["Signal"]) if str(row["Signal"]).lstrip("-").isdigit() else -1
-    battery = int(row["Battery"]) if str(row["Battery"]).lstrip("-").isdigit() else -1
-    send_state = "发送可用" if row["Send"] == "yes" else "发送关闭"
-    receive_state = "接收可用" if row["Receive"] == "yes" else "接收关闭"
-    operator = row["NetName"] or row["NetCode"] or ""
+def infer_operator(network_code: str = "", imsi: str = "") -> str:
+    code = "".join(ch for ch in (network_code or imsi[:5]) if ch.isdigit())
+    if code.startswith("460"):
+        code = code[:5]
+    operators = {
+        "46000": "中国移动",
+        "46002": "中国移动",
+        "46004": "中国移动",
+        "46007": "中国移动",
+        "46008": "中国移动",
+        "46001": "中国联通",
+        "46006": "中国联通",
+        "46009": "中国联通",
+        "46010": "中国联通",
+        "46003": "中国电信",
+        "46005": "中国电信",
+        "46011": "中国电信",
+        "46012": "中国电信",
+    }
+    return operators.get(code, "")
+
+
+def parse_smsd_monitor_output(output: str) -> dict:
+    values = {}
+    for raw in output.splitlines():
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        values[key.strip().lower()] = value.strip()
+
+    signal = values.get("networksignal", "")
+    battery = values.get("batterpercent", "")
+    imsi = values.get("imsi", "")
+    operator = values.get("netname", "") or values.get("netcode", "")
+    sms_counts = format_sms_counts(values.get("sent", ""), values.get("received", ""), values.get("failed", ""))
+    network_state = "smsd 运行中" if values else ""
+    switch, switch_tone = describe_network_switch(signal, f"{signal}%" if signal else "", network_state)
     return {
-        "sim_state": "已识别" if row["IMSI"] else "未知",
-        "signal": f"{signal}%" if signal >= 0 else "",
-        "network_level": f"{signal}%" if signal >= 0 else "",
-        "network_state": f"{receive_state} / {send_state}",
-        "operator": operator,
-        "battery": f"{battery}%" if battery >= 0 else "",
+        "sim_state": describe_sim_state(imsi, bool(values)),
+        "sim_identity": mask_sim_identity(imsi),
+        "sms_counts": sms_counts,
+        "signal": signal,
+        "network_level": f"{signal}%" if signal else "",
+        "network_state": network_state,
+        "network_switch": switch,
+        "network_switch_tone": switch_tone,
+        "operator": operator or infer_operator(operator, imsi),
+        "battery": f"{battery}%" if battery else "",
         "error": "",
-        "source_updated_at": row["UpdatedInDB"] or "",
+        "source_updated_at": "",
         "checked_at": now_text(),
     }
 
 
-def get_sim_status() -> dict:
-    cached = get_state("sim_status_cache")
-    if cached:
-        try:
-            data = json.loads(cached)
-            if time.time() - float(data.get("ts", 0)) < SIM_STATUS_CACHE_SECONDS and not data.get("status", {}).get("error"):
-                return data["status"]
-        except Exception:
-            pass
+def read_smsd_monitor_status() -> dict | None:
+    cmd = [
+        "/usr/bin/gammu-smsd-monitor" if Path("/usr/bin/gammu-smsd-monitor").exists() else "gammu-smsd-monitor",
+        "-c",
+        str(SMSDRC),
+        "-d",
+        "0",
+        "-n",
+        "1",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode != 0 or not output:
+        return None
+    status = parse_smsd_monitor_output(output)
+    if status.get("signal") or status.get("sim_state") == "已识别":
+        return status
+    return None
 
-    smsd_status = read_smsd_phone_status()
+
+def render_status_pill(label: str, tone: str = "muted") -> str:
+    safe_tone = tone if tone in {"ok", "bad", "warn", "muted", "info"} else "muted"
+    return f'<span class="status-pill {safe_tone}">{html.escape(label or "未知")}</span>'
+
+
+def render_network_level_value(status: dict) -> str:
+    level = html.escape(str(status.get("network_level") or "-"))
+    pill = render_status_pill(str(status.get("network_switch") or "未知"), str(status.get("network_switch_tone") or "muted"))
+    return f'<span data-network-level-text>{level}</span>{pill}'
+
+
+def render_sim_state_value(label: str, tone: str) -> str:
+    safe_tone = tone if tone in {"ok", "bad", "warn", "muted", "info"} else "muted"
+    escaped = html.escape(label)
+    return f'<span class="status-pill {safe_tone}" data-sim-badge>{escaped}</span>'
+
+
+def get_sim_status(use_cache: bool = False) -> dict:
+    smsd_status = read_smsd_monitor_status()
     if smsd_status:
-        set_state("sim_status_cache", json.dumps({"ts": time.time(), "status": smsd_status}, ensure_ascii=False))
         return smsd_status
 
     cmd = ["/usr/bin/gammu" if Path("/usr/bin/gammu").exists() else "gammu", "-c", str(SMSDRC), "monitor", "1"]
     status = {
-        "sim_state": "未知",
+        "sim_state": "状态未知",
+        "sim_identity": "",
+        "sms_counts": "",
         "signal": "",
         "network_level": "",
         "network_state": "",
+        "network_switch": "未知",
+        "network_switch_tone": "muted",
         "operator": "",
         "battery": "",
         "error": "",
@@ -557,7 +649,6 @@ def get_sim_status() -> dict:
     except Exception as exc:
         status["error"] = str(exc)[:300]
 
-    set_state("sim_status_cache", json.dumps({"ts": time.time(), "status": status}, ensure_ascii=False))
     return status
 
 
@@ -568,20 +659,25 @@ def render_sim_status_panel() -> str:
     if status.get("error"):
         sim_label = "不可用"
     rows = [
-        ("SIM 卡", sim_label),
-        ("信号强度", status.get("signal") or "-"),
-        ("网络强度", status.get("network_level") or "-"),
-        ("网络状态", status.get("network_state") or "-"),
-        ("运营商", status.get("operator") or "-"),
-        ("检测时间", status.get("checked_at") or "-"),
+        ("sim_state", "SIM 卡", render_sim_state_value(str(sim_label), tone)),
+        ("sim_identity", "SIM 标识", html.escape(str(status.get("sim_identity") or "-"))),
+        ("sms_counts", "短信计数", html.escape(str(status.get("sms_counts") or "-"))),
+        ("signal", "信号强度", html.escape(str(status.get("signal") or "-"))),
+        ("network_level", "网络强度", render_network_level_value(status)),
+        ("operator", "运营商", html.escape(str(status.get("operator") or "-"))),
+        ("checked_at", "检测时间", html.escape(str(status.get("checked_at") or "-"))),
     ]
-    body = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>" for k, v in rows)
+    body = "".join(
+        f'<tr><th>{html.escape(label)}</th><td data-sim-field="{html.escape(field)}">{value}</td></tr>'
+        for field, label, value in rows
+    )
     error = ""
     if status.get("error"):
-        error = f'<div class="hint badtext">状态读取失败：{html.escape(status["error"])}</div>'
+        error = f'<div class="hint badtext" data-sim-error>状态读取失败：{html.escape(status["error"])}</div>'
     return (
-        f'<div class="panel band sim-status"><h2>SIM 卡状态 <span class="badge {tone}">{html.escape(sim_label)}</span></h2>'
-        f'<table class="kv">{body}</table>{error}</div>'
+        '<div id="sim-status-panel" class="panel band sim-status"><div class="sim-status-head"><h2>SIM 卡状态</h2>'
+        '<button type="button" class="secondary sim-refresh" data-sim-refresh>刷新</button></div>'
+        f'<table class="kv">{body}</table><div data-sim-error-slot>{error}</div></div>'
     )
 
 
@@ -1169,6 +1265,100 @@ def worker_loop(stop_event: threading.Event) -> None:
         stop_event.wait(5)
 
 
+def format_sse_event(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def sim_status_script() -> str:
+    return """
+  <script>
+    (function() {
+      var panel = document.getElementById("sim-status-panel");
+      if (!panel || !window.EventSource) return;
+      var refresh = panel.querySelector("[data-sim-refresh]");
+      var source = null;
+      function setField(name, value) {
+        var cell = panel.querySelector('[data-sim-field="' + name + '"]');
+        if (cell) cell.textContent = value || "-";
+      }
+      function pillTone(tone) {
+        return ["ok", "bad", "warn", "muted", "info"].indexOf(tone) >= 0 ? tone : "muted";
+      }
+      function renderSimState(status) {
+        var cell = panel.querySelector('[data-sim-field="sim_state"]');
+        if (!cell) return;
+        var hasError = Boolean(status.error);
+        var label = hasError ? "不可用" : (status.sim_state || "未知");
+        cell.textContent = "";
+        var badge = document.createElement("span");
+        badge.setAttribute("data-sim-badge", "");
+        badge.className = "status-pill " + (hasError ? "bad" : "ok");
+        badge.textContent = label;
+        cell.appendChild(badge);
+      }
+      function renderNetworkLevel(status) {
+        var cell = panel.querySelector('[data-sim-field="network_level"]');
+        if (!cell) return;
+        cell.textContent = "";
+        var value = document.createElement("span");
+        value.setAttribute("data-network-level-text", "");
+        value.textContent = status.network_level || "-";
+        var pill = document.createElement("span");
+        pill.className = "status-pill " + pillTone(status.network_switch_tone);
+        pill.textContent = status.network_switch || "未知";
+        cell.appendChild(value);
+        cell.appendChild(pill);
+      }
+      function setRefresh(active) {
+        if (!refresh) return;
+        refresh.disabled = active;
+        refresh.textContent = active ? "刷新中" : "刷新";
+      }
+      function closeStream() {
+        if (source) source.close();
+        source = null;
+      }
+      function render(status) {
+        var hasError = Boolean(status.error);
+        renderSimState(status);
+        setField("sim_identity", status.sim_identity);
+        setField("sms_counts", status.sms_counts);
+        setField("signal", status.signal);
+        renderNetworkLevel(status);
+        setField("operator", status.operator);
+        setField("checked_at", status.checked_at);
+        var slot = panel.querySelector("[data-sim-error-slot]");
+        if (slot) {
+          slot.innerHTML = hasError ? '<div class="hint badtext" data-sim-error></div>' : "";
+          var error = slot.querySelector("[data-sim-error]");
+          if (error) error.textContent = "状态读取失败：" + status.error;
+        }
+      }
+      function startStream() {
+        closeStream();
+        source = new EventSource("/api/sim-status/stream");
+        setRefresh(true);
+        source.addEventListener("sim-status", function(event) {
+          try {
+            render(JSON.parse(event.data));
+          } catch (err) {}
+        });
+        source.addEventListener("done", function() {
+          closeStream();
+          setRefresh(false);
+        });
+        source.onerror = function() {
+          closeStream();
+          setRefresh(false);
+        };
+      }
+      if (refresh) refresh.addEventListener("click", startStream);
+      startStream();
+    })();
+  </script>"""
+
+
 def page(title: str, body: str, active: str = "") -> bytes:
     nav = [
         ("/", "数据面板", "dashboard"),
@@ -1183,6 +1373,7 @@ def page(title: str, body: str, active: str = "") -> bytes:
         f'<a class="nav-link {"active" if key == active else ""}" href="{href}">{label}</a>'
         for href, label, key in nav
     )
+    script = sim_status_script() if active == "dashboard" else ""
     html_doc = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1220,6 +1411,9 @@ def page(title: str, body: str, active: str = "") -> bytes:
     .stat .value {{ font-size:28px; font-weight:800; margin-top:8px; }}
     .band {{ padding:16px; margin-top:16px; }}
     .sim-status {{ margin-bottom:16px; }}
+    .sim-status-head {{ display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }}
+    .sim-status-head h2 {{ margin:0; }}
+    .sim-refresh {{ min-width:72px; padding:8px 12px; font-size:13px; }}
     table {{ width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
     th, td {{ text-align:left; padding:10px 12px; border-bottom:1px solid #edf1f5; vertical-align:top; font-size:13px; line-height:20px; }}
     th {{ color:#475467; background:#f8fafc; font-weight:700; }}
@@ -1231,6 +1425,12 @@ def page(title: str, body: str, active: str = "") -> bytes:
     .badge.warn {{ background:#fef0c7; color:var(--amber); }}
     .badge.info {{ background:#dbeafe; color:#1d4ed8; }}
     .badge.muted {{ background:#eef2f6; color:#475467; }}
+    .status-pill {{ display:inline-flex; align-items:center; min-height:22px; margin-left:8px; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:800; }}
+    .status-pill.ok {{ background:#dcfae6; color:var(--green); }}
+    .status-pill.bad {{ background:#fee4e2; color:var(--red); }}
+    .status-pill.warn {{ background:#fef0c7; color:var(--amber); }}
+    .status-pill.info {{ background:#dbeafe; color:#1d4ed8; }}
+    .status-pill.muted {{ background:#eef2f6; color:#475467; }}
     form.panel {{ padding:18px; max-width:760px; }}
     label {{ display:block; font-size:13px; color:#344054; font-weight:700; margin:14px 0 6px; }}
     input, textarea, select {{ width:100%; border:1px solid #cfd8e3; border-radius:6px; padding:10px 11px; font:inherit; background:#fff; color:var(--ink); }}
@@ -1297,6 +1497,7 @@ def page(title: str, body: str, active: str = "") -> bytes:
       <div class="content">{body}</div>
     </main>
   </div>
+{script}
 </body>
 </html>"""
     return html_doc.encode("utf-8")
@@ -1340,6 +1541,25 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def stream_sim_status(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            for index in range(SIM_STATUS_STREAM_SECONDS):
+                self.wfile.write(format_sse_event("sim-status", get_sim_status(use_cache=False)).encode("utf-8"))
+                self.wfile.flush()
+                if index < SIM_STATUS_STREAM_SECONDS - 1:
+                    time.sleep(1)
+            self.wfile.write(format_sse_event("done", {"done": True}).encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def redirect(self, path: str) -> None:
         self.send_response(303)
@@ -1403,6 +1623,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/login")
             self.send_header("Set-Cookie", "sms_admin=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
             self.end_headers()
+        elif path == "/api/sim-status/stream":
+            self.stream_sim_status()
         elif path == "/":
             self.send_html(self.render_dashboard())
         elif path == "/inbound":

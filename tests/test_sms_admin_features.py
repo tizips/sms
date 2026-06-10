@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import datetime as dt
 import importlib.util
+import json
 import os
 import pathlib
 import shutil
@@ -196,10 +197,13 @@ def test_dashboard_omits_cost_protection_notice():
         try:
             admin.subprocess.run = lambda *args, **kwargs: RunResult()
             admin.get_sim_status = lambda: {
-                "sim_state": "已识别",
-                "signal": "80%",
+                "sim_state": "已识别（IMSI 可用）",
+                "sim_identity": "46011******4699",
+                "sms_counts": "已发 0 / 已收 3 / 失败 0",
+                "signal": "80",
                 "network_level": "80%",
-                "network_state": "接收可用 / 发送可用",
+                "network_switch": "数据关闭",
+                "network_switch_tone": "ok",
                 "operator": "Test",
                 "checked_at": admin.now_text(),
                 "error": "",
@@ -211,6 +215,33 @@ def test_dashboard_omits_cost_protection_notice():
 
         assert_true("费用保护" not in body, "dashboard omits cost protection notice")
         assert_true('class="panel band sim-status"' in body, "SIM status panel has dashboard spacing class")
+        assert_true('id="sim-status-panel"' in body, "SIM status panel has live update root")
+        sim_row = body[body.index("<tr><th>SIM 卡</th>") : body.index("</tr>", body.index("<tr><th>SIM 卡</th>"))]
+        sim_header = body[body.index('class="sim-status-head"') : body.index("</div>", body.index('class="sim-status-head"'))]
+        assert_true("data-sim-badge" in sim_row, "SIM status badge is inside the SIM card row")
+        assert_true("data-sim-state-text" not in body, "SIM card row shows only the status badge without duplicate text")
+        assert_true(sim_row.count("已识别（IMSI 可用）") == 1, "SIM card status label appears only once")
+        assert_true("data-sim-badge" not in sim_header, "SIM status header no longer contains the status badge")
+        assert_true("<th>SIM 标识</th>" in body, "dashboard shows masked SIM identity")
+        assert_true('data-sim-field="sim_identity"' in body, "SIM identity cell exposes live update field")
+        assert_true("46011******4699" in body, "SIM identity is masked")
+        assert_true("460115033554699" not in body, "full IMSI is not exposed in dashboard HTML")
+        assert_true("<th>短信计数</th>" in body, "dashboard shows SMS counters")
+        assert_true('data-sim-field="sms_counts"' in body, "SMS counters cell exposes live update field")
+        assert_true("已发 0 / 已收 3 / 失败 0" in body, "SMS counters are rendered")
+        assert_true('data-sim-field="signal"' in body, "SIM status cells expose live update fields")
+        assert_true('data-sim-field="network_level"' in body, "network level cell exposes live update field")
+        assert_true('class="status-pill ok"' in body, "network status is shown as an ok capsule")
+        assert_true("<th>网络状态</th>" not in body, "network status is folded into network level row")
+        assert_true('class="sim-status-head"' in body, "SIM status panel has a header action row")
+        assert_true('data-sim-refresh' in body, "SIM status panel has a refresh button")
+        assert_true('new EventSource("/api/sim-status/stream")' in body, "dashboard subscribes to SIM status SSE")
+        assert_true('refresh.addEventListener("click", startStream)' in body, "refresh button starts a new SSE stream")
+        assert_true("if (source) source.close();" in body, "refresh closes the existing SSE stream before restarting")
+        assert_true("renderSimState(status);" in body, "SSE updates SIM row badge")
+        assert_true('setField("sim_identity", status.sim_identity);' in body, "SSE updates masked SIM identity")
+        assert_true('setField("sms_counts", status.sms_counts);' in body, "SSE updates SMS counters")
+        assert_true("renderNetworkLevel(status);" in body, "SSE updates network level capsule")
     finally:
         cleanup(base)
 
@@ -313,16 +344,95 @@ Network level        : 78 percent
 SIM IMSI             : 460001234567890
 """
         info = admin.parse_sim_status_output(output)
-        assert_true(info["sim_state"] == "已识别", "SIM IMSI marks SIM as identified")
+        assert_true(info["sim_state"] == "已识别（IMSI 可用）", "SIM IMSI marks SIM as identified")
         assert_true(info["signal"] == "-67 dBm", "signal strength is parsed")
         assert_true(info["network_level"] == "78 percent", "network level is parsed")
         assert_true(info["network_state"] == "home network", "network state is parsed")
+        assert_true(info["network_switch"] == "数据关闭", "network registration still reports data switch as closed")
+        assert_true(info["network_switch_tone"] == "ok", "closed data switch uses safe capsule")
         assert_true(info["operator"] == "China Mobile", "operator is parsed")
     finally:
         cleanup(base)
 
 
-def test_read_smsd_phone_status_prefers_status_database():
+def test_parse_smsd_monitor_output():
+    admin, base = load_admin()
+    try:
+        output = """
+Client: Gammu 1.42.0 on Linux
+PhoneID: quectel-em120r
+IMEI: 015930000049750
+IMSI: 460115033554699
+Sent: 0
+Received: 1
+Failed: 0
+BatterPercent: 0
+NetworkSignal: 100
+"""
+        info = admin.parse_smsd_monitor_output(output)
+        assert_true(info["sim_state"] == "已识别（IMSI 可用）", "monitor IMSI marks SIM as identified")
+        assert_true(info["signal"] == "100", "monitor signal is parsed without percent sign")
+        assert_true(info["network_level"] == "100%", "monitor network level follows signal")
+        assert_true(info["network_state"] == "smsd 运行中", "monitor status reports smsd source")
+        assert_true(info["network_switch"] == "数据关闭", "monitor signal does not imply data switch is on")
+        assert_true(info["network_switch_tone"] == "ok", "closed data switch uses safe capsule")
+        assert_true(info["operator"] == "中国电信", "monitor IMSI infers China Telecom")
+        assert_true(info["sim_identity"] == "46011******4699", "monitor IMSI is masked for display")
+        assert_true(info["sms_counts"] == "已发 0 / 已收 1 / 失败 0", "monitor SMS counters are formatted")
+    finally:
+        cleanup(base)
+
+
+def test_parse_smsd_monitor_output_shows_missing_sim_and_network_off():
+    admin, base = load_admin()
+    try:
+        output = """
+Client: Gammu 1.42.0 on Linux
+PhoneID: quectel-em120r
+Sent: 0
+Received: 1
+Failed: 0
+BatterPercent: 0
+NetworkSignal: 0
+"""
+        info = admin.parse_smsd_monitor_output(output)
+        assert_true(info["sim_state"] == "未识别（无 IMSI）", "missing monitor IMSI is shown as a specific SIM state")
+        assert_true(info["sim_identity"] == "", "missing monitor IMSI has no display identity")
+        assert_true(info["sms_counts"] == "已发 0 / 已收 1 / 失败 0", "monitor SMS counters still render without IMSI")
+        assert_true(info["network_switch"] == "数据关闭", "missing signal still reports data switch as closed")
+        assert_true(info["network_switch_tone"] == "ok", "closed data switch remains safe")
+    finally:
+        cleanup(base)
+
+
+def test_get_sim_status_can_bypass_cache_and_use_smsd_monitor():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        calls = []
+
+        class RunResult:
+            returncode = 0
+            stdout = "IMSI: 460115033554699\nNetworkSignal: 100\nBatterPercent: 0\n"
+            stderr = ""
+
+        old_run = admin.subprocess.run
+        try:
+            admin.subprocess.run = lambda cmd, **kwargs: calls.append(cmd) or RunResult()
+            status = admin.get_sim_status(use_cache=False)
+        finally:
+            admin.subprocess.run = old_run
+
+        assert_true(calls and "gammu-smsd-monitor" in calls[0][0], "SIM status uses smsd monitor first")
+        assert_true(status["sim_state"] == "已识别（IMSI 可用）", "uncached monitor status identifies SIM")
+        assert_true(status["sim_identity"] == "46011******4699", "uncached monitor status masks IMSI")
+        assert_true(status["signal"] == "100", "uncached monitor status signal omits percent sign")
+        assert_true(status["network_switch"] == "数据关闭", "uncached monitor status keeps data switch closed")
+    finally:
+        cleanup(base)
+
+
+def test_get_sim_status_ignores_smsd_database_for_realtime_status():
     admin, base = load_admin()
     try:
         admin.init_db()
@@ -355,16 +465,47 @@ def test_read_smsd_phone_status_prefers_status_database():
                   (ID, UpdatedInDB, InsertIntoDB, TimeOut, Send, Receive, IMEI, IMSI,
                    NetCode, NetName, Client, Battery, Signal, Sent, Received)
                 VALUES ('modem', '2026-06-10 11:11:11', '2026-06-10 11:00:00',
-                        '2026-06-10 11:12:00', 'yes', 'yes', 'imei', 'imsi',
-                        '46011', 'China Telecom', 'Gammu', 90, 78, 0, 0)
+                        '2026-06-10 11:12:00', 'yes', 'yes', 'imei', 'db-imsi',
+                        '99999', 'DB Operator', 'Gammu', 90, 1, 0, 0)
                 """
             )
-        status = admin.read_smsd_phone_status()
-        assert_true(status["sim_state"] == "已识别", "smsd phone row marks SIM as identified")
-        assert_true(status["signal"] == "78%", "smsd phone row provides signal percent")
-        assert_true(status["battery"] == "90%", "smsd phone row provides battery percent")
-        assert_true(status["operator"] == "China Telecom", "smsd phone row provides operator")
-        assert_true(status["checked_at"] != "2026-06-10 11:11:11", "SIM checked time is current detection time")
+
+        class RunResult:
+            returncode = 0
+            stdout = """
+Phone information
+Signal strength      : -67 dBm
+Network level        : 88 percent
+SIM IMSI             : 460115033554699
+"""
+            stderr = ""
+
+        old_monitor = admin.read_smsd_monitor_status
+        old_run = admin.subprocess.run
+        try:
+            admin.read_smsd_monitor_status = lambda: None
+            admin.subprocess.run = lambda *args, **kwargs: RunResult()
+            status = admin.get_sim_status()
+        finally:
+            admin.read_smsd_monitor_status = old_monitor
+            admin.subprocess.run = old_run
+
+        assert_true(status["signal"] == "-67 dBm", "real-time status ignores stale smsd database signal")
+        assert_true(status["network_level"] == "88 percent", "real-time status uses serial monitor output")
+        assert_true(status["operator"] == "中国电信", "real-time status infers operator from serial IMSI")
+    finally:
+        cleanup(base)
+
+
+def test_sse_event_formats_json_payload():
+    admin, base = load_admin()
+    try:
+        event = admin.format_sse_event("sim-status", {"sim_state": "已识别", "signal": "100%"})
+        assert_true(event.startswith("event: sim-status\n"), "SSE event starts with event name")
+        data_line = [line for line in event.splitlines() if line.startswith("data: ")][0]
+        payload = json.loads(data_line.removeprefix("data: "))
+        assert_true(payload["sim_state"] == "已识别", "SSE payload is JSON")
+        assert_true(event.endswith("\n\n"), "SSE event is terminated by a blank line")
     finally:
         cleanup(base)
 
@@ -877,7 +1018,11 @@ def main():
         test_optional_future_time_allows_blank_for_immediate_send,
         test_strategy_actions_show_delete_left_and_save_right,
         test_parse_sim_status_output,
-        test_read_smsd_phone_status_prefers_status_database,
+        test_parse_smsd_monitor_output,
+        test_parse_smsd_monitor_output_shows_missing_sim_and_network_off,
+        test_get_sim_status_can_bypass_cache_and_use_smsd_monitor,
+        test_get_sim_status_ignores_smsd_database_for_realtime_status,
+        test_sse_event_formats_json_payload,
         test_sms_command_uses_unicode_for_chinese_text,
         test_sms_command_keeps_gsm7_without_unicode_flag,
         test_retry_wait_uses_minutes,
