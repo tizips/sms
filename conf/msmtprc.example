@@ -1,0 +1,10 @@
+defaults
+auth on
+tls on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+account default
+host smtp.example.com
+port 587
+from sms-gateway@example.com
+user sms-gateway@example.com
+password CHANGE_ME

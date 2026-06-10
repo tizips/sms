@@ -1,0 +1,11 @@
+[Unit]
+Description=Enable Quectel EM120R-GL radio for SMS
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/quectel-radio-unlock
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
