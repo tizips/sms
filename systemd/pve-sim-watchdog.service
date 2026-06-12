@@ -1,0 +1,7 @@
+[Unit]
+Description=PVE SIM watchdog for SMS Admin
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/pve-radio-agent.env
+ExecStart=/usr/local/sbin/pve-sim-watchdog

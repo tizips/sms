@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import datetime as dt
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -16,11 +17,35 @@ TIME_FORMAT = "%Y-%m-%d %H:%M:%S %z"
 def load_admin():
     base = pathlib.Path(tempfile.mkdtemp(prefix="sms-admin-test-", dir="/private/tmp"))
     os.environ["SMS_BASE"] = str(base)
-    spec = importlib.util.spec_from_file_location("sms_admin_under_test", ROOT / "admin" / "sms_admin.py")
+    spec = importlib.util.spec_from_file_location("sms_admin_under_test", ROOT / "admin" / "main.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module, base
+
+
+def load_pve_agent():
+    loader = importlib.machinery.SourceFileLoader("pve_radio_agent_under_test", str(ROOT / "bin" / "pve-radio-agent"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def load_pve_watchdog():
+    loader = importlib.machinery.SourceFileLoader("pve_sim_watchdog_under_test", str(ROOT / "bin" / "pve-sim-watchdog"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def load_sms_hook():
+    loader = importlib.machinery.SourceFileLoader("sms_received_hook_under_test", str(ROOT / "bin" / "sms-received-hook"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 def cleanup(base):
@@ -30,6 +55,695 @@ def cleanup(base):
 def assert_true(value, message):
     if not value:
         raise AssertionError(message)
+
+
+def test_postgres_initial_migration_contains_dispatch_and_cancel_fields():
+    sql = (ROOT / "migrations" / "0001_initial_schema.sql").read_text(encoding="utf-8")
+    assert_true("CREATE TABLE IF NOT EXISTS sms_dispatch_jobs" in sql, "migration creates dispatch jobs")
+    assert_true("idempotency_key TEXT NOT NULL UNIQUE" in sql, "dispatch jobs enforce idempotency")
+    assert_true("cancel_requested INTEGER NOT NULL DEFAULT 0" in sql, "migration stores cancel requests")
+    assert_true("dispatch_job_id BIGINT" in sql, "outbound rows can reference dispatch jobs")
+
+
+def test_postgres_migration_adds_send_plan_phone_parts_to_existing_tables():
+    migration = ROOT / "migrations" / "0002_send_plan_phone_parts.sql"
+    assert_true(migration.exists(), "follow-up migration exists for already-applied databases")
+    sql = migration.read_text(encoding="utf-8")
+    assert_true("ALTER TABLE send_plans" in sql, "migration alters existing send_plans table")
+    assert_true("ADD COLUMN IF NOT EXISTS country_code" in sql, "migration adds country code to existing plans")
+    assert_true("ADD COLUMN IF NOT EXISTS phone_number" in sql, "migration adds phone number to existing plans")
+
+
+def test_dockerfile_sets_admin_container_timezone():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert_true("TZ=Asia/Shanghai" in dockerfile, "admin container declares Shanghai timezone")
+    assert_true("tzdata" in dockerfile, "admin image installs timezone database")
+    assert_true("/etc/localtime" in dockerfile, "admin image links localtime for Python astimezone")
+
+
+def test_pve_agent_parses_unread_cmgl_messages():
+    agent = load_pve_agent()
+    output = """
++CMGL: 8,"REC UNREAD","+8613000000000","","26/06/11,10:30:00+32"
+77ED4FE16D4B8BD5
+
+OK
+"""
+    rows = agent.parse_cmgl_messages(output)
+    assert_true(len(rows) == 1, "one unread CMGL message is parsed")
+    assert_true(rows[0]["index"] == 8, "message index is parsed")
+    assert_true(rows[0]["sender"] == "+8613000000000", "sender is parsed")
+    assert_true(rows[0]["text"] == "短信测试", "UCS2 message body is decoded")
+    assert_true(rows[0]["raw_ids"] == "pve-cmgl-8", "raw id is stable")
+
+
+def test_pve_agent_dispatch_uses_gammu_smsd_inject():
+    agent = load_pve_agent()
+    cmd = agent.build_gammu_sms_command("+8613000000000", "中文测试")
+    assert_true("gammu-smsd-inject" in cmd[0], "PVE dispatch uses gammu-smsd-inject")
+    assert_true("TEXT" in cmd, "PVE dispatch injects text SMS")
+    assert_true("-unicode" in cmd, "Unicode text is submitted as unicode")
+    assert_true("AT+CMGS" not in " ".join(cmd), "PVE dispatch does not use direct AT sending")
+
+
+def test_pve_agent_send_sms_gammu_marks_sent_when_smsd_moves_spool_file():
+    agent = load_pve_agent()
+    base = pathlib.Path(tempfile.mkdtemp(prefix="pve-agent-spool-", dir="/private/tmp"))
+    outbox = base / "outbox"
+    sent = base / "sent"
+    error = base / "error"
+    outbox.mkdir()
+    sent.mkdir()
+    error.mkdir()
+    filename = "OUTC20260611_194500_00_+8613000000000_sms0.smsbackup"
+    outbox_file = outbox / filename
+    sent_file = sent / filename
+    outbox_file.write_text("queued sms", encoding="utf-8")
+    sent_file.write_text("sent sms", encoding="utf-8")
+
+    class RunResult:
+        returncode = 0
+        stdout = f"Written message with ID {outbox_file}\n"
+        stderr = ""
+
+    sentinel = object()
+    saved = {
+        name: getattr(agent, name, sentinel)
+        for name in ("OUTBOX_PATH", "SENT_PATH", "ERROR_PATH", "SENT_WAIT_SECONDS")
+    }
+    old_command = agent.build_gammu_sms_command
+    old_run = agent.subprocess.run
+    try:
+        agent.OUTBOX_PATH = outbox
+        agent.SENT_PATH = sent
+        agent.ERROR_PATH = error
+        agent.SENT_WAIT_SECONDS = 0
+        agent.build_gammu_sms_command = lambda destination, text: ["gammu-smsd-inject"]
+        agent.subprocess.run = lambda cmd, **kwargs: RunResult()
+        status, message = agent.send_sms_gammu("+8613000000000", "sent by PVE")
+    finally:
+        agent.build_gammu_sms_command = old_command
+        agent.subprocess.run = old_run
+        for name, value in saved.items():
+            if value is sentinel:
+                try:
+                    delattr(agent, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(agent, name, value)
+        cleanup(base)
+
+    assert_true(status == "sent", "PVE agent reports sent after smsd moves the spool file to sent")
+    assert_true(str(outbox_file) in message, "PVE agent keeps gammu output for audit")
+
+
+def test_pve_agent_status_reports_failed_smsd_over_stale_monitor_memory():
+    agent = load_pve_agent()
+    calls = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(returncode=3, stdout="failed\n")
+        if cmd and cmd[0] == "journalctl":
+            return RunResult(
+                stdout="Jun 11 19:21:02 pve gammu-smsd[56074]: Can't open device: Error opening device. Unknown, busy or no permissions. (DEVICEOPENERROR[2])\n"
+            )
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 460115033554699\nNetworkSignal: 75\nSent: 1\nReceived: 2\nFailed: 0\n")
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    try:
+        agent.subprocess.run = fake_run
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+
+    assert_true(calls and calls[0][:3] == ["systemctl", "is-active", "gammu-smsd.service"], "PVE agent checks smsd service before trusting monitor memory")
+    assert_true(status["sim_state_tone"] == "bad", "failed smsd is reported as bad status")
+    assert_true(status["sim_identity"] == "", "stale IMSI is not returned when smsd is failed")
+    assert_true(status["registration_state"] != "smsd 运行中", "failed smsd does not report running state")
+    assert_true(status["error"], "failed smsd includes an operator-visible error")
+
+
+def test_pve_agent_status_reports_active_smsd_init_errors_over_empty_monitor_identity():
+    agent = load_pve_agent()
+    calls = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: \nNetworkSignal: 0\nSent: 0\nReceived: 0\nFailed: 0\n")
+        if cmd and cmd[0] == "journalctl":
+            return RunResult(stdout="Jun 11 19:34:52 pve gammu-smsd[134478]: Error at init connection: Unknown error. (UNKNOWN[27])\n")
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    try:
+        agent.subprocess.run = fake_run
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+
+    assert_true(any(cmd and cmd[0] == "journalctl" for cmd in calls), "PVE agent checks recent smsd logs when monitor has no IMSI")
+    assert_true(status["sim_state_tone"] == "bad", "active smsd init errors are reported as bad status")
+    assert_true(status["sim_identity"] == "", "empty monitor IMSI stays empty")
+    assert_true(status["registration_state"] == "smsd 串口通信失败", "recent init errors override empty monitor running state")
+    assert_true(status["error"] == "smsd 串口通信失败", "recent init errors are surfaced")
+
+
+def test_pve_agent_status_checks_at_presence_over_stale_monitor_imsi():
+    agent = load_pve_agent()
+    commands = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class FakeLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeAT:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def command(self, command, **kwargs):
+            commands.append(command)
+            responses = {
+                "AT": "OK",
+                "ATE0": "OK",
+                "AT+CPIN?": "+CME ERROR: 13",
+                "AT+QSIMSTAT?": "+QSIMSTAT: 0,0\n\nOK",
+            }
+            return responses.get(command, "OK")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 460115033554699\nNetworkSignal: 100\nSent: 0\nReceived: 0\nFailed: 0\n")
+        if cmd and cmd[0] == "journalctl":
+            return RunResult(stdout="")
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    old_lock = agent.RadioLock
+    old_at = agent.ATSession
+    try:
+        agent.subprocess.run = fake_run
+        agent.RadioLock = FakeLock
+        agent.ATSession = FakeAT
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+        agent.RadioLock = old_lock
+        agent.ATSession = old_at
+
+    assert_true("AT+CPIN?" in commands and "AT+QSIMSTAT?" in commands, "PVE agent checks AT SIM presence")
+    assert_true(status["sim_state"] == "未识别（无法访问 SIM 卡）", "AT no-SIM overrides stale monitor IMSI")
+    assert_true(status["sim_state_tone"] == "bad", "AT no-SIM uses bad tone")
+    assert_true(status["sim_identity"] == "", "stale monitor IMSI is cleared")
+    assert_true(status["error"] == "smsd 无法访问 SIM 卡", "AT no-SIM error is surfaced")
+
+
+def test_pve_agent_status_checks_mbim_presence_over_stale_monitor_imsi():
+    agent = load_pve_agent()
+    mbim_calls = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class FailingAT:
+        def __enter__(self):
+            raise OSError("AT port busy")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 460115033554699\nNetworkSignal: 100\nSent: 0\nReceived: 0\nFailed: 0\n")
+        if cmd and cmd[0] == "mbimcli":
+            mbim_calls.append(cmd)
+            return RunResult(stdout="Ready state: 'sim-not-inserted'\nSIM ICCID: 'unknown'\n")
+        if cmd and cmd[0] == "journalctl":
+            return RunResult(stdout="")
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    old_at = agent.ATSession
+    try:
+        agent.subprocess.run = fake_run
+        agent.ATSession = FailingAT
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+        agent.ATSession = old_at
+
+    assert_true(mbim_calls, "PVE agent checks MBIM subscriber readiness")
+    assert_true(status["sim_state"] == "未识别（无法访问 SIM 卡）", "MBIM no-SIM overrides stale monitor IMSI")
+    assert_true(status["sim_identity"] == "", "MBIM no-SIM clears stale monitor IMSI")
+
+
+def test_pve_agent_status_checks_mbim_presence_over_empty_monitor_identity():
+    agent = load_pve_agent()
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: \nNetworkSignal: 0\nSent: 0\nReceived: 0\nFailed: 0\n")
+        if cmd and cmd[0] == "mbimcli":
+            return RunResult(stdout="Ready state: 'sim-not-inserted'\nSIM ICCID: 'unknown'\n")
+        if cmd and cmd[0] == "journalctl":
+            return RunResult(stdout="Error at init connection: Unknown error. (UNKNOWN[27])\n")
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    try:
+        agent.subprocess.run = fake_run
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+
+    assert_true(status["sim_state"] == "未识别（无法访问 SIM 卡）", "MBIM no-SIM overrides empty monitor and smsd log errors")
+    assert_true(status["registration_state"] == "smsd 无法访问 SIM 卡", "empty monitor plus MBIM no-SIM uses SIM-specific state")
+
+
+def test_pve_agent_status_reads_phone_number_from_mbim():
+    agent = load_pve_agent()
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 460115033554699\nNetworkSignal: 100\nSent: 0\nReceived: 0\nFailed: 0\n")
+        if cmd and cmd[0] == "mbimcli":
+            return RunResult(
+                stdout="""
+[/dev/wwan0mbim0] Subscriber ready status retrieved:
+             Ready state: 'initialized'
+            Subscriber ID: '460115033554699'
+                SIM ICCID: '89861121234567890123'
+       Telephone numbers: (1) '+8613800138000'
+"""
+            )
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    try:
+        agent.subprocess.run = fake_run
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+
+    assert_true(status["phone_number"] == "+8613800138000", "PVE status exposes SIM phone number from MBIM")
+    assert_true(status["country_code"] == "86", "PVE status exposes country code from MBIM")
+    assert_true(status["phone_number_e164"] == "+86 - 13800138000", "PVE status exposes formatted phone number from MBIM")
+
+
+def test_pve_agent_status_builds_e164_for_uk_local_mbim_number():
+    agent = load_pve_agent()
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 234102356147404\nNetworkSignal: 72\nSent: 0\nReceived: 5\nFailed: 0\n")
+        if cmd and cmd[0] == "mbimcli":
+            return RunResult(
+                stdout="""
+[/dev/wwan0mbim0] Subscriber ready status retrieved:
+             Ready state: 'initialized'
+            Subscriber ID: '234102356147404'
+                SIM ICCID: '8944110069285243963F'
+       Telephone numbers: (1) '07922675277'
+"""
+            )
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    try:
+        agent.subprocess.run = fake_run
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+
+    assert_true(status["phone_number"] == "07922675277", "PVE status keeps the local MBIM phone number")
+    assert_true(status["country_code"] == "44", "PVE status infers UK country code from MBIM")
+    assert_true(status["phone_number_e164"] == "+44 - 7922675277", "PVE status exposes formatted UK phone number")
+    assert_true(status["operator"] == "O2 UK", "PVE status infers UK O2 operator from IMSI")
+
+
+def test_pve_agent_status_checks_at_presence_when_smsd_is_inactive():
+    agent = load_pve_agent()
+    commands = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class FakeLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeAT:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def command(self, command, **kwargs):
+            commands.append(command)
+            return {
+                "AT": "OK",
+                "ATE0": "OK",
+                "AT+CPIN?": "+CME ERROR: 13",
+                "AT+QSIMSTAT?": "+QSIMSTAT: 0,0\n\nOK",
+            }.get(command, "OK")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(returncode=3, stdout="inactive\n")
+        if cmd and cmd[0] == "journalctl":
+            return RunResult(stdout="Jun 11 19:53:42 pve gammu-smsd[137320]: Error at init connection: Unknown error. (UNKNOWN[27])\n")
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    old_lock = agent.RadioLock
+    old_at = agent.ATSession
+    try:
+        agent.subprocess.run = fake_run
+        agent.RadioLock = FakeLock
+        agent.ATSession = FakeAT
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+        agent.RadioLock = old_lock
+        agent.ATSession = old_at
+
+    assert_true("AT+CPIN?" in commands and "AT+QSIMSTAT?" in commands, "inactive smsd status checks AT SIM presence")
+    assert_true(status["sim_state"] == "未识别（无法访问 SIM 卡）", "inactive smsd plus AT no-SIM reports no SIM")
+    assert_true(status["registration_state"] == "smsd 无法访问 SIM 卡", "inactive smsd no-SIM uses SIM-specific state")
+
+
+def test_pve_watchdog_treats_empty_monitor_imsi_as_not_ready():
+    watchdog = load_pve_watchdog()
+
+    class RunResult:
+        returncode = 0
+        stdout = "PhoneID: pve-quectel\nIMEI: \nIMSI: \nNetworkSignal: 0\n"
+        stderr = ""
+
+    old_exists = watchdog.os.path.exists
+    old_run = watchdog.subprocess.run
+    try:
+        watchdog.os.path.exists = lambda path: True
+        watchdog.subprocess.run = lambda cmd, **kwargs: RunResult()
+        ready, details = watchdog.smsd_monitor_status()
+    finally:
+        watchdog.os.path.exists = old_exists
+        watchdog.subprocess.run = old_run
+
+    assert_true(not ready, "empty monitor IMSI is not SIM ready")
+    assert_true("monitor_ready=False" in details, "watchdog details explain monitor is not ready")
+
+
+def test_pve_watchdog_prefers_mbim_presence_over_stale_monitor_imsi():
+    watchdog = load_pve_watchdog()
+    calls = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="PhoneID: pve-quectel\nIMEI: 015930000049750\nIMSI: 460115033554699\nNetworkSignal: 75\n")
+        if cmd and cmd[0] == "mbimcli":
+            return RunResult(stdout="Ready state: 'sim-not-inserted'\nSIM ICCID: 'unknown'\n")
+        return RunResult()
+
+    old_exists = watchdog.os.path.exists
+    old_run = watchdog.subprocess.run
+    try:
+        watchdog.os.path.exists = lambda path: True
+        watchdog.subprocess.run = fake_run
+        ready, details = watchdog.sim_is_ready()
+    finally:
+        watchdog.os.path.exists = old_exists
+        watchdog.subprocess.run = old_run
+
+    assert_true(any(cmd and cmd[0] == "mbimcli" for cmd in calls), "watchdog checks MBIM subscriber readiness")
+    assert_true(not ready, "MBIM no-SIM overrides stale monitor IMSI")
+    assert_true("sim-not-inserted" in details, "watchdog details include MBIM no-SIM state")
+
+
+def test_pve_watchdog_main_does_not_force_wwan_down_when_sim_ready():
+    watchdog = load_pve_watchdog()
+    calls = []
+
+    old_sim_is_ready = watchdog.sim_is_ready
+    old_force = watchdog.force_wwan_down
+    old_recover = watchdog.recover_sim
+    old_log = watchdog.log
+    try:
+        watchdog.sim_is_ready = lambda: (True, "monitor_ready=True")
+        watchdog.force_wwan_down = lambda: calls.append("force_wwan_down")
+        watchdog.recover_sim = lambda: calls.append("recover_sim")
+        watchdog.log = lambda message: calls.append(("log", message))
+        result = watchdog.main()
+    finally:
+        watchdog.sim_is_ready = old_sim_is_ready
+        watchdog.force_wwan_down = old_force
+        watchdog.recover_sim = old_recover
+        watchdog.log = old_log
+
+    assert_true(result == 0, "ready watchdog exits successfully")
+    assert_true("force_wwan_down" not in calls, "ready watchdog does not force wwan0 down")
+    assert_true("recover_sim" not in calls, "ready watchdog does not run recovery")
+
+
+def test_sms_received_hook_can_disable_local_mail_forwarding():
+    hook = load_sms_hook()
+    previous = os.environ.get("SMS_FORWARD_IN_HOOK")
+    try:
+        os.environ["SMS_FORWARD_IN_HOOK"] = "0"
+        assert_true(not hook.should_forward_in_hook(), "PVE hook can disable local mail forwarding")
+        os.environ["SMS_FORWARD_IN_HOOK"] = "1"
+        assert_true(hook.should_forward_in_hook(), "legacy hook can keep local mail forwarding")
+    finally:
+        if previous is None:
+            os.environ.pop("SMS_FORWARD_IN_HOOK", None)
+        else:
+            os.environ["SMS_FORWARD_IN_HOOK"] = previous
+
+
+def test_sms_received_hook_publishes_inbound_notification_when_configured():
+    hook = load_sms_hook()
+    previous_url = os.environ.get("SMS_REDIS_URL")
+    previous_channel = os.environ.get("SMS_INBOUND_CHANNEL")
+    calls = []
+    old_publish = hook.redis_publish
+    try:
+        os.environ["SMS_REDIS_URL"] = "redis://127.0.0.1:6379/0"
+        os.environ["SMS_INBOUND_CHANNEL"] = "sms:inbound"
+        hook.redis_publish = lambda url, channel, payload: calls.append((url, channel, payload))
+        hook.publish_inbound_notification(42)
+        assert_true(calls, "hook publishes inbound notification when Redis URL is configured")
+        assert_true(calls[0][0] == "redis://127.0.0.1:6379/0", "hook uses configured Redis URL")
+        assert_true(calls[0][1] == "sms:inbound", "hook publishes to inbound channel")
+        assert_true(json.loads(calls[0][2])["inbound_id"] == 42, "hook payload contains inbound id")
+    finally:
+        hook.redis_publish = old_publish
+        if previous_url is None:
+            os.environ.pop("SMS_REDIS_URL", None)
+        else:
+            os.environ["SMS_REDIS_URL"] = previous_url
+        if previous_channel is None:
+            os.environ.pop("SMS_INBOUND_CHANNEL", None)
+        else:
+            os.environ["SMS_INBOUND_CHANNEL"] = previous_channel
+
+
+def write_gammu_backup(path: pathlib.Path, ref: str, total: int, seq: int, text: str, timestamp: str = "20260611T130646") -> None:
+    encoded = text.encode("utf-16-be").hex().upper()
+    path.write_text(
+        f"""; This file format was designed for Gammu and is compatible with Gammu+
+; Saved {timestamp} (Thu Jun 11 13:06:46 2026)
+
+[SMSBackup000]
+UDH = 050003{ref}{total:02X}{seq:02X}
+DateTime = {timestamp}
+Number = "13003630212"
+Text00 = {encoded}
+Coding = Unicode_No_Compression
+Length = {len(text)}
+""",
+        encoding="utf-8",
+    )
+
+
+def load_sms_hook_with_base(base: pathlib.Path, wait_seconds: str = "45"):
+    old_base = os.environ.get("SMS_BASE")
+    old_wait = os.environ.get("SMS_MULTIPART_WAIT_SECONDS")
+    try:
+        os.environ["SMS_BASE"] = str(base)
+        os.environ["SMS_MULTIPART_WAIT_SECONDS"] = wait_seconds
+        return load_sms_hook()
+    finally:
+        if old_base is None:
+            os.environ.pop("SMS_BASE", None)
+        else:
+            os.environ["SMS_BASE"] = old_base
+        if old_wait is None:
+            os.environ.pop("SMS_MULTIPART_WAIT_SECONDS", None)
+        else:
+            os.environ["SMS_MULTIPART_WAIT_SECONDS"] = old_wait
+
+
+def test_sms_received_hook_defers_and_combines_multipart_within_short_window():
+    base = pathlib.Path(tempfile.mkdtemp(prefix="sms-hook-multipart-", dir="/private/tmp"))
+    try:
+        inbox = base / "spool" / "inbox"
+        inbox.mkdir(parents=True)
+        first = inbox / "IN20260611_130646_00_13003630212_00.txt"
+        second = inbox / "IN20260611_130645_00_13003630212_00.txt"
+        timestamp = dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+        write_gammu_backup(first, "0C", 2, 1, "Ollama 对系统要求很低\n", timestamp)
+        write_gammu_backup(second, "0C", 2, 2, "ux Kernel", timestamp)
+        hook = load_sms_hook_with_base(base, "45")
+        flushes = []
+        old_spawn = hook.spawn_multipart_flush
+        try:
+            hook.spawn_multipart_flush = lambda key, deadline: flushes.append((key, deadline))
+            first_record = hook.prepare_inbound_record(
+                "2026-06-11 13:07:08 +0800",
+                "13003630212",
+                "Ollama 对系统要求很低\n",
+                [first.name],
+                "pve-quectel",
+                1,
+                1,
+            )
+            second_record = hook.prepare_inbound_record(
+                "2026-06-11 13:07:20 +0800",
+                "13003630212",
+                "ux Kernel",
+                [second.name],
+                "pve-quectel",
+                1,
+                1,
+            )
+        finally:
+            hook.spawn_multipart_flush = old_spawn
+
+        assert_true(first_record is None, "first multipart part is deferred inside the short window")
+        assert_true(flushes, "deferred multipart part schedules a bounded flush")
+        assert_true(second_record is not None, "second multipart part completes the deferred record")
+        assert_true(second_record["text"] == "Ollama 对系统要求很低\nux Kernel", "multipart text is combined in sequence")
+        assert_true(second_record["raw_ids"] == f"{first.name} {second.name}", "combined record keeps both raw ids")
+        assert_true(second_record["sms_messages"] == 2, "combined record stores expected part count")
+        assert_true(second_record["decoded_parts"] == 2, "combined record stores decoded part count")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_sms_received_hook_flushes_incomplete_multipart_after_short_window():
+    base = pathlib.Path(tempfile.mkdtemp(prefix="sms-hook-timeout-", dir="/private/tmp"))
+    try:
+        inbox = base / "spool" / "inbox"
+        inbox.mkdir(parents=True)
+        first = inbox / "IN20260611_130646_00_13003630212_00.txt"
+        write_gammu_backup(first, "0D", 2, 1, "验证码 123456", "20200101T000000")
+        hook = load_sms_hook_with_base(base, "45")
+        record = hook.prepare_inbound_record(
+            "2026-06-11 13:07:08 +0800",
+            "13003630212",
+            "验证码 123456",
+            [first.name],
+            "pve-quectel",
+            1,
+            1,
+        )
+
+        assert_true(record is not None, "expired multipart window flushes available text")
+        assert_true("验证码 123456" in record["text"], "flushed multipart keeps available code text")
+        assert_true("分片未齐" in record["text"], "flushed multipart is marked incomplete")
+        assert_true(record["sms_messages"] == 2, "flushed multipart records expected total parts")
+        assert_true(record["decoded_parts"] == 1, "flushed multipart records available decoded parts")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def test_strategy_schema_and_default_minutes():
@@ -108,6 +822,33 @@ def test_destination_from_form_applies_country_code():
             admin.destination_from_form({"country_code": "+86", "destination": "+447700900123"}) == "+447700900123",
             "full international destination is kept when pasted",
         )
+    finally:
+        cleanup(base)
+
+
+def test_split_destination_for_form_separates_known_country_codes():
+    admin, base = load_admin()
+    try:
+        country_code, phone_number = admin.split_destination_for_form("+447922675277")
+        assert_true(country_code == "+44", "UK destination country code is split for editing")
+        assert_true(phone_number == "7922675277", "UK destination local number is split for editing")
+
+        country_code, phone_number = admin.split_destination_for_form("13000000000")
+        assert_true(country_code == "+86", "local destinations keep the default country code")
+        assert_true(phone_number == "13000000000", "local destinations keep the original phone number")
+    finally:
+        cleanup(base)
+
+
+def test_destination_parts_from_form_keep_storage_fields_separate():
+    admin, base = load_admin()
+    try:
+        country_code, phone_number, destination = admin.destination_parts_from_form(
+            {"country_code": "+44", "destination": "07922675277"}
+        )
+        assert_true(country_code == "+44", "form country code is normalized for storage")
+        assert_true(phone_number == "07922675277", "form phone number is stored separately")
+        assert_true(destination == "+4407922675277", "destination is still combined for sending")
     finally:
         cleanup(base)
 
@@ -230,9 +971,10 @@ def test_dashboard_omits_cost_protection_notice():
         assert_true('data-sim-field="sms_counts"' in body, "SMS counters cell exposes live update field")
         assert_true("已发 0 / 已收 3 / 失败 0" in body, "SMS counters are rendered")
         assert_true('data-sim-field="signal"' in body, "SIM status cells expose live update fields")
-        assert_true('data-sim-field="network_level"' in body, "network level cell exposes live update field")
+        assert_true("<th>网络强度</th>" not in body, "dashboard no longer shows network strength row")
+        assert_true('data-sim-field="network_level"' not in body, "network level cell is removed")
         assert_true('class="status-pill ok"' in body, "network status is shown as an ok capsule")
-        assert_true("<th>网络状态</th>" not in body, "network status is folded into network level row")
+        assert_true("<th>网络状态</th>" not in body, "network status is not shown as a separate row")
         assert_true('class="sim-status-head"' in body, "SIM status panel has a header action row")
         assert_true('data-sim-refresh' in body, "SIM status panel has a refresh button")
         assert_true('new EventSource("/api/sim-status/stream")' in body, "dashboard subscribes to SIM status SSE")
@@ -241,8 +983,146 @@ def test_dashboard_omits_cost_protection_notice():
         assert_true("renderSimState(status);" in body, "SSE updates SIM row badge")
         assert_true('setField("sim_identity", status.sim_identity);' in body, "SSE updates masked SIM identity")
         assert_true('setField("sms_counts", status.sms_counts);' in body, "SSE updates SMS counters")
-        assert_true("renderNetworkLevel(status);" in body, "SSE updates network level capsule")
+        assert_true("renderNetworkLevel(status);" not in body, "SSE no longer updates removed network level row")
     finally:
+        cleanup(base)
+
+
+def test_dashboard_sim_status_places_phone_signal_unit_and_data_switch():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+
+        class Dummy:
+            table_inbound = admin.AdminHandler.table_inbound
+            table_outbound = admin.AdminHandler.table_outbound
+
+        class RunResult:
+            stdout = "active"
+
+        old_run = admin.subprocess.run
+        old_get_sim_status = admin.get_sim_status
+        try:
+            admin.subprocess.run = lambda *args, **kwargs: RunResult()
+            admin.get_sim_status = lambda: {
+                "sim_state": "已识别（IMSI 可用）",
+                "sim_identity": "46011******4699",
+                "phone_number": "+8613800138000",
+                "sms_counts": "已发 0 / 已收 3 / 失败 0",
+                "signal": "80",
+                "network_level": "80%",
+                "network_switch": "数据关闭",
+                "network_switch_tone": "ok",
+                "operator": "中国电信",
+                "checked_at": "2026-06-10 22:00:00 +0800",
+                "error": "",
+            }
+            body = admin.AdminHandler.render_dashboard(Dummy()).decode("utf-8")
+        finally:
+            admin.subprocess.run = old_run
+            admin.get_sim_status = old_get_sim_status
+
+        sim_identity_pos = body.index("<th>SIM 标识</th>")
+        phone_pos = body.index("<th>手机号</th>")
+        assert_true(sim_identity_pos < phone_pos, "phone number row is directly below SIM identity context")
+        assert_true('data-sim-field="phone_number"' in body, "phone number cell exposes live update field")
+        assert_true("+8613800138000" in body, "phone number is rendered")
+        signal_row = body[body.index("<tr><th>信号强度</th>") : body.index("</tr>", body.index("<tr><th>信号强度</th>"))]
+        assert_true(">80%<" in signal_row, "numeric signal strength is displayed with a percent unit")
+        operator_row = body[body.index("<tr><th>运营商</th>") : body.index("</tr>", body.index("<tr><th>运营商</th>"))]
+        assert_true("<th>网络强度</th>" not in body, "network strength row is removed")
+        assert_true('data-sim-field="network_level"' not in body, "removed network strength row has no live update field")
+        assert_true("中国电信" in operator_row and "数据关闭" in operator_row, "data switch is appended to operator row")
+        assert_true(operator_row.index("中国电信") < operator_row.index("数据关闭"), "operator text appears before data switch")
+        assert_true("2026/06/10 22:00:00" in body, "dashboard checked time uses JS-style display format")
+        assert_true('setField("phone_number", status.phone_number);' in body, "SSE updates phone number")
+        assert_true("renderOperator(status);" in body, "SSE updates operator row with data switch")
+    finally:
+        cleanup(base)
+
+
+def test_dashboard_sim_error_uses_bad_pill_without_error_detail():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+
+        class Dummy:
+            table_inbound = admin.AdminHandler.table_inbound
+            table_outbound = admin.AdminHandler.table_outbound
+
+        class RunResult:
+            stdout = "active"
+
+        old_run = admin.subprocess.run
+        old_get_sim_status = admin.get_sim_status
+        try:
+            admin.subprocess.run = lambda *args, **kwargs: RunResult()
+            admin.get_sim_status = lambda: {
+                "sim_state": "未识别（无法访问 SIM 卡）",
+                "sim_state_tone": "muted",
+                "sim_identity": "",
+                "sms_counts": "",
+                "signal": "",
+                "network_level": "",
+                "network_switch": "未知",
+                "network_switch_tone": "muted",
+                "operator": "",
+                "checked_at": admin.now_text(),
+                "error": "pve agent timeout",
+            }
+            body = admin.AdminHandler.render_dashboard(Dummy()).decode("utf-8")
+        finally:
+            admin.subprocess.run = old_run
+            admin.get_sim_status = old_get_sim_status
+
+        sim_row = body[body.index("<tr><th>SIM 卡</th>") : body.index("</tr>", body.index("<tr><th>SIM 卡</th>"))]
+        assert_true('class="status-pill bad"' in sim_row, "SIM error is shown as a bad capsule")
+        assert_true(">未识别（无法访问 SIM 卡）<" in sim_row, "SIM error capsule keeps the sim_state label")
+        assert_true(">不可用<" not in sim_row, "SIM error capsule does not replace sim_state with a generic label")
+        assert_true(">sim_state<" not in sim_row, "SIM error capsule does not show the field name")
+        assert_true("pve agent timeout" not in body, "dashboard omits the bottom SIM error detail")
+        assert_true("data-sim-error" not in body, "dashboard does not render or update a SIM error detail row")
+        assert_true("状态读取失败" not in body, "SSE script does not inject the old bottom error detail")
+    finally:
+        cleanup(base)
+
+
+def test_dashboard_uses_pve_service_label_in_pve_dispatch_mode():
+    admin, base = load_admin()
+    old_mode = os.environ.get("SMS_DISPATCH_MODE")
+    try:
+        os.environ["SMS_DISPATCH_MODE"] = "pve"
+        admin.init_db()
+
+        class Dummy:
+            table_inbound = admin.AdminHandler.table_inbound
+            table_outbound = admin.AdminHandler.table_outbound
+
+        old_get_sim_status = admin.get_sim_status
+        try:
+            admin.get_sim_status = lambda: {
+                "sim_state": "已识别（IMSI 可用）",
+                "sim_identity": "46011******4699",
+                "sms_counts": "已发 0 / 已收 3 / 失败 0",
+                "signal": "80",
+                "network_level": "80%",
+                "network_switch": "数据关闭",
+                "network_switch_tone": "ok",
+                "operator": "Test",
+                "checked_at": admin.now_text(),
+                "error": "",
+            }
+            body = admin.AdminHandler.render_dashboard(Dummy()).decode("utf-8")
+        finally:
+            admin.get_sim_status = old_get_sim_status
+
+        assert_true("PVE Radio Agent" in body, "PVE mode dashboard labels the PVE service")
+        assert_true("gammu-smsd" not in body, "PVE mode dashboard does not show local gammu-smsd")
+    finally:
+        if old_mode is None:
+            os.environ.pop("SMS_DISPATCH_MODE", None)
+        else:
+            os.environ["SMS_DISPATCH_MODE"] = old_mode
         cleanup(base)
 
 
@@ -298,7 +1178,7 @@ def test_optional_future_time_allows_blank_for_immediate_send():
         cleanup(base)
 
 
-def test_strategy_actions_show_delete_left_and_save_right():
+def test_strategy_page_uses_table_and_modals_without_command_timeout():
     admin, base = load_admin()
     try:
         admin.init_db()
@@ -315,18 +1195,143 @@ def test_strategy_actions_show_delete_left_and_save_right():
             strategy_id = int(cur.lastrowid)
 
         body = admin.AdminHandler.render_settings(object()).decode("utf-8")
-        default_start = body.index("<h2>默认策略</h2>")
-        default_section = body[default_start : body.index("</section>", default_start)]
-        start = body.index("<h2>Delete me</h2>")
-        section = body[start : body.index("</section>", start)]
+        table = body[body.index("<table>") : body.index("</table>", body.index("<table>"))]
+        create_dialog = body[body.index('id="strategy-create"') : body.index("</dialog>", body.index('id="strategy-create"'))]
+        edit_dialog = body[body.index(f'id="strategy-edit-{strategy_id}"') : body.index("</dialog>", body.index(f'id="strategy-edit-{strategy_id}"'))]
+        row = table[table.index("Delete me") : table.index("</tr>", table.index("Delete me"))]
 
-        assert_true(default_section.count("默认策略不能删除") == 1, "default strategy hint appears once")
-        assert_true('<div class="actions strategy-actions">' in section, "strategy actions use shared row")
-        assert_true(section.index("删除策略") < section.index("保存策略"), "delete button is left of save button")
-        assert_true(
-            section.index("</form>") < section.index(f'<form id="strategy-delete-{strategy_id}"'),
-            "delete form is outside save form",
+        assert_true('<div class="toolbar"><h2>发送策略</h2>' in body, "strategy page uses the list toolbar")
+        assert_true('onclick="document.getElementById(\'strategy-create\').showModal()"' in body, "strategy create opens a modal")
+        assert_true("<th>ID</th><th>名称</th><th>发送间隔</th><th>失败重试</th>" in table, "strategy page renders a table list")
+        assert_true("strategy-card" not in body, "strategy page no longer renders card forms")
+        assert_true("提交命令超时" not in body, "strategy command timeout field is removed from the UI")
+        assert_true('name="command_timeout_seconds"' not in body, "strategy command timeout input is removed from forms")
+        assert_true("默认策略不能删除" not in body, "default strategy delete hint is not shown in the actions column")
+        assert_true('action="/settings"' in create_dialog, "strategy create modal posts to settings")
+        assert_true(f'action="/settings/{strategy_id}/delete"' in row, "strategy row contains delete action")
+        assert_true(f"strategy-edit-{strategy_id}" in row, "strategy row opens an edit modal")
+        assert_true(f'action="/settings"' in edit_dialog, "strategy edit modal posts updates")
+        assert_true(f'value="{strategy_id}"' in edit_dialog, "strategy edit modal carries strategy id")
+    finally:
+        cleanup(base)
+
+
+def test_strategy_send_interval_uses_value_and_unit_ui():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        admin.save_strategy_from_form(
+            {
+                "name": "Every two hours",
+                "send_interval_value": "2",
+                "send_interval_unit": "hour",
+                "retry_interval_minutes": "10",
+                "max_retries": "1",
+                "command_timeout_seconds": "45",
+                "active": "yes",
+            }
         )
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM send_strategies WHERE name = 'Every two hours'").fetchone()
+        assert_true(row["send_interval_minutes"] == 120, "strategy stores computed interval minutes")
+
+        body = admin.AdminHandler.render_settings(object()).decode("utf-8")
+        start = body.index(f'id="strategy-edit-{row["id"]}"')
+        section = body[start : body.index("</dialog>", start)]
+        options = admin.strategy_options_html(row["id"])
+
+        assert_true('class="strategy-interval-field"' in section, "strategy send interval occupies its own row")
+        assert_true(
+            section.index('class="strategy-interval-field"') < section.index('<div class="row">'),
+            "strategy send interval appears above retry/max fields",
+        )
+        assert_true('name="send_interval_value"' in section, "strategy form uses a numeric interval input")
+        assert_true('value="2"' in section, "strategy interval input displays the clearer value")
+        assert_true('name="send_interval_unit"' in section, "strategy form has an interval unit selector")
+        assert_true('<option value="hour" selected>小时</option>' in section, "strategy interval unit displays hours")
+        assert_true("间隔为 0" in section and "不开启下一次发送" in section, "strategy form explains zero interval behavior")
+        assert_true("每 2 小时发送间隔" in options, "strategy dropdown displays a clear interval label")
+    finally:
+        cleanup(base)
+
+
+def test_strategy_update_preserves_hidden_command_timeout():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        with admin.db() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO send_strategies
+                  (name, send_interval_minutes, retry_interval_minutes, max_retries, command_timeout_seconds,
+                   active, is_default, created_at, updated_at)
+                VALUES ('Keep timeout', 3, 7, 1, 88, 1, 0, ?, ?)
+                """,
+                (admin.now_text(), admin.now_text()),
+            )
+            strategy_id = int(cur.lastrowid)
+
+        admin.save_strategy_from_form(
+            {
+                "strategy_id": str(strategy_id),
+                "name": "Keep timeout edited",
+                "send_interval_value": "2",
+                "send_interval_unit": "hour",
+                "retry_interval_minutes": "9",
+                "max_retries": "2",
+                "active": "yes",
+            }
+        )
+
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM send_strategies WHERE id = ?", (strategy_id,)).fetchone()
+        assert_true(row["command_timeout_seconds"] == 88, "hidden command timeout is preserved on strategy edit")
+    finally:
+        cleanup(base)
+
+
+def test_delete_and_archive_list_actions_require_confirmation():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        strategy = admin.get_default_strategy()
+        delete_plan_id = admin.create_send_plan("Delete confirm", "13000000000", "delete body", admin.now_text(), strategy["id"])
+        archive_plan_id = admin.create_send_plan("Archive confirm", "13000000001", "archive body", admin.now_text(), strategy["id"])
+        with admin.db() as conn:
+            outbound_id = conn.execute("SELECT outbound_id FROM send_plans WHERE id = ?", (archive_plan_id,)).fetchone()["outbound_id"]
+            conn.execute(
+                "UPDATE outbound_sms SET status = 'submitted', attempts = 1, submitted_at = ?, updated_at = ? WHERE id = ?",
+                (admin.now_text(), admin.now_text(), outbound_id),
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO send_strategies
+                  (name, send_interval_minutes, retry_interval_minutes, max_retries, command_timeout_seconds,
+                   active, is_default, created_at, updated_at)
+                VALUES ('Delete strategy confirm', 3, 7, 1, 45, 1, 0, ?, ?)
+                """,
+                (admin.now_text(), admin.now_text()),
+            )
+            strategy_id = int(cur.lastrowid)
+
+        plans_body = admin.AdminHandler.render_plans(object()).decode("utf-8")
+        settings_body = admin.AdminHandler.render_settings(object()).decode("utf-8")
+        delete_plan_form = plans_body[
+            plans_body.index(f'action="/plans/{delete_plan_id}/delete"') : plans_body.index("</form>", plans_body.index(f'action="/plans/{delete_plan_id}/delete"'))
+        ]
+        archive_plan_form = plans_body[
+            plans_body.index(f'action="/plans/{archive_plan_id}/archive"') : plans_body.index("</form>", plans_body.index(f'action="/plans/{archive_plan_id}/archive"'))
+        ]
+        strategy_delete_form = settings_body[
+            settings_body.index(f'action="/settings/{strategy_id}/delete"') : settings_body.index("</form>", settings_body.index(f'action="/settings/{strategy_id}/delete"'))
+        ]
+
+        assert_true('onsubmit="return confirm(' in delete_plan_form, "plan delete requires a second confirmation")
+        assert_true("确认删除" in delete_plan_form, "plan delete confirmation names the destructive action")
+        assert_true('onsubmit="return confirm(' in archive_plan_form, "plan archive requires a second confirmation")
+        assert_true("确认归档" in archive_plan_form, "plan archive confirmation names the action")
+        assert_true('onsubmit="return confirm(' in strategy_delete_form, "strategy delete requires a second confirmation")
+        assert_true("确认删除" in strategy_delete_form, "strategy delete confirmation names the destructive action")
     finally:
         cleanup(base)
 
@@ -401,6 +1406,87 @@ NetworkSignal: 0
         assert_true(info["sms_counts"] == "已发 0 / 已收 1 / 失败 0", "monitor SMS counters still render without IMSI")
         assert_true(info["network_switch"] == "数据关闭", "missing signal still reports data switch as closed")
         assert_true(info["network_switch_tone"] == "ok", "closed data switch remains safe")
+    finally:
+        cleanup(base)
+
+
+def test_parse_smsd_monitor_output_hides_unknown_negative_signal():
+    admin, base = load_admin()
+    try:
+        output = """
+Client: Gammu 1.42.0 on Linux
+PhoneID: quectel-em120r
+IMEI: 015930000049750
+IMSI: 460115033554699
+Sent: 0
+Received: 0
+Failed: 0
+BatterPercent: 0
+NetworkSignal: -1
+"""
+        info = admin.parse_smsd_monitor_output(output)
+        assert_true(info["sim_state"] == "已识别（IMSI 可用）", "monitor IMSI still identifies SIM")
+        assert_true(info["signal"] == "", "unknown monitor signal is hidden")
+        assert_true(info["network_level"] == "", "unknown monitor signal does not render a percentage")
+        assert_true(info["operator"] == "中国电信", "monitor IMSI still infers operator")
+    finally:
+        cleanup(base)
+
+
+def test_parse_smsd_health_output_reports_recent_no_sim():
+    admin, base = load_admin()
+    try:
+        output = """
+Jun 10 20:35:41 sms gammu-smsd[549]: Error getting security status: 无法访问 SIM 卡。 (NOSIM[49])
+Jun 10 20:36:14 sms gammu-smsd[549]: Error at init connection: 未知错误。 (UNKNOWN[27])
+"""
+        status = admin.parse_smsd_health_output(output)
+        assert_true(status is not None, "recent smsd no-SIM log produces a status override")
+        assert_true(status["sim_state"] == "未识别（无法访问 SIM 卡）", "NOSIM is shown as no SIM")
+        assert_true(status["sim_state_tone"] == "bad", "NOSIM uses a bad capsule")
+        assert_true(status["sim_identity"] == "", "stale IMSI is cleared for no SIM")
+        assert_true(status["signal"] == "", "stale signal is cleared for no SIM")
+        assert_true(status["operator"] == "", "stale operator is cleared for no SIM")
+        assert_true(status["network_switch"] == "数据关闭", "data switch stays closed")
+    finally:
+        cleanup(base)
+
+
+def test_get_sim_status_prefers_smsd_health_issue_over_stale_monitor_memory():
+    admin, base = load_admin()
+    try:
+        stale_monitor = {
+            "sim_state": "已识别（IMSI 可用）",
+            "sim_state_tone": "ok",
+            "sim_identity": "46011******4699",
+            "sms_counts": "已发 0 / 已收 3 / 失败 0",
+            "signal": "81",
+            "network_level": "81%",
+            "network_state": "smsd 运行中",
+            "network_switch": "数据关闭",
+            "network_switch_tone": "ok",
+            "operator": "中国电信",
+            "battery": "0%",
+            "error": "",
+            "source_updated_at": "",
+            "checked_at": admin.now_text(),
+        }
+        no_sim = admin.parse_smsd_health_output("无法访问 SIM 卡。 (NOSIM[49])")
+
+        old_monitor = admin.read_smsd_monitor_status
+        old_health = admin.read_smsd_health_status
+        try:
+            admin.read_smsd_monitor_status = lambda: stale_monitor
+            admin.read_smsd_health_status = lambda: no_sim
+            status = admin.get_sim_status()
+        finally:
+            admin.read_smsd_monitor_status = old_monitor
+            admin.read_smsd_health_status = old_health
+
+        assert_true(status["sim_state"] == "未识别（无法访问 SIM 卡）", "recent smsd issue overrides stale monitor SIM state")
+        assert_true(status["sim_identity"] == "", "recent smsd issue clears stale monitor IMSI")
+        assert_true(status["signal"] == "", "recent smsd issue clears stale monitor signal")
+        assert_true(status["sms_counts"] == "已发 0 / 已收 3 / 失败 0", "SMS counters can remain visible with the no-SIM override")
     finally:
         cleanup(base)
 
@@ -497,6 +1583,51 @@ SIM IMSI             : 460115033554699
         cleanup(base)
 
 
+def test_get_sim_status_uses_pve_agent_when_configured():
+    old_url = os.environ.get("PVE_RADIO_AGENT_URL")
+    os.environ["PVE_RADIO_AGENT_URL"] = "http://pve-agent.local:8091"
+    admin, base = load_admin()
+    try:
+        calls = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "sim_state": "已识别（IMSI 可用）",
+                        "sim_identity": "46011******4699",
+                        "operator": "中国电信",
+                        "signal": "-63 dBm",
+                        "network_switch": "数据关闭",
+                        "checked_at": "2026-06-10 22:00:00 +0800",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        old_urlopen = admin.urllib.request.urlopen
+        try:
+            admin.urllib.request.urlopen = lambda request, timeout=0: calls.append((request.full_url, timeout)) or Response()
+            status = admin.get_sim_status(use_cache=False)
+        finally:
+            admin.urllib.request.urlopen = old_urlopen
+
+        assert_true(calls == [("http://pve-agent.local:8091/sim/status", 3)], "SIM status calls PVE agent endpoint")
+        assert_true(status["operator"] == "中国电信", "PVE agent operator is returned")
+        assert_true(status["network_switch"] == "数据关闭", "PVE agent keeps data switch closed")
+    finally:
+        if old_url is None:
+            os.environ.pop("PVE_RADIO_AGENT_URL", None)
+        else:
+            os.environ["PVE_RADIO_AGENT_URL"] = old_url
+        cleanup(base)
+
+
 def test_sse_event_formats_json_payload():
     admin, base = load_admin()
     try:
@@ -506,6 +1637,23 @@ def test_sse_event_formats_json_payload():
         payload = json.loads(data_line.removeprefix("data: "))
         assert_true(payload["sim_state"] == "已识别", "SSE payload is JSON")
         assert_true(event.endswith("\n\n"), "SSE event is terminated by a blank line")
+    finally:
+        cleanup(base)
+
+
+def test_sim_status_stream_payload_prefers_e164_phone_number():
+    admin, base = load_admin()
+    try:
+        status = {
+            "sim_state": "已识别（IMSI 可用）",
+            "phone_number": "07922675277",
+            "country_code": "44",
+            "phone_number_e164": "+447922675277",
+        }
+        payload = admin.sim_status_stream_payload(status)
+        assert_true(payload["phone_number"] == "+447922675277", "SIM status stream sends E.164 phone number")
+        assert_true(payload["phone_number_e164"] == "+447922675277", "SIM status stream keeps explicit E.164 field")
+        assert_true(status["phone_number"] == "07922675277", "SIM status stream payload does not mutate source status")
     finally:
         cleanup(base)
 
@@ -525,6 +1673,433 @@ def test_sms_command_keeps_gsm7_without_unicode_flag():
     try:
         cmd = admin.build_sms_command("13000000000", "hello")
         assert_true("-unicode" not in cmd, "GSM-7 SMS command does not force unicode")
+    finally:
+        cleanup(base)
+
+
+def test_status_badge_distinguishes_waiting_sent_and_timeout():
+    admin, base = load_admin()
+    try:
+        assert_true("等待 PVE 发送" in admin.status_badge("dispatching"), "dispatching means waiting for PVE execution")
+        assert_true("已提交" in admin.status_badge("submitted"), "submitted means the SMS can no longer be cancelled")
+        assert_true("已发送" in admin.status_badge("sent"), "sent has a distinct final status")
+        assert_true("发送超时" in admin.status_badge("send_timeout"), "send timeout has a distinct final status")
+    finally:
+        cleanup(base)
+
+
+def test_mail_settings_are_saved_in_database_and_password_is_not_echoed():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        admin.save_mail_settings(
+            {
+                "mail_enabled": "yes",
+                "mail_to": "ops@example.com",
+                "mail_from": "sms@example.com",
+                "smtp_host": "smtp.example.com",
+                "smtp_port": "465",
+                "smtp_user": "sms@example.com",
+                "smtp_password": "secret-pass",
+                "smtp_security": "ssl",
+            }
+        )
+        settings = admin.mail_config()
+        assert_true(settings["MAIL_ENABLED"] == "1", "mail config is enabled from database")
+        assert_true(settings["MAIL_TO"] == "ops@example.com", "recipient is stored in database")
+        assert_true(settings["MAIL_FROM"] == "sms@example.com", "sender is stored in database")
+        assert_true(settings["SMTP_HOST"] == "smtp.example.com", "SMTP host is stored in database")
+        assert_true(settings["SMTP_PASSWORD"] == "secret-pass", "SMTP password is stored in database")
+
+        admin.save_mail_settings(
+            {
+                "mail_enabled": "yes",
+                "mail_to": "ops2@example.com",
+                "mail_from": "sms@example.com",
+                "smtp_host": "smtp.example.com",
+                "smtp_port": "465",
+                "smtp_user": "sms@example.com",
+                "smtp_password": "",
+                "smtp_security": "ssl",
+            }
+        )
+        settings = admin.mail_config()
+        assert_true(settings["MAIL_TO"] == "ops2@example.com", "mail settings update non-secret fields")
+        assert_true(settings["SMTP_PASSWORD"] == "secret-pass", "blank password keeps existing database secret")
+
+        settings_body = admin.AdminHandler.render_settings(object()).decode("utf-8")
+        mail_body = admin.AdminHandler.render_mail_settings(object()).decode("utf-8")
+        assert_true('href="/mail">邮件配置</a>' in mail_body, "mail configuration has a left nav entry")
+        assert_true("<h2>邮件配置</h2>" not in settings_body, "strategy page no longer embeds mail configuration")
+        assert_true('name="smtp_host"' not in settings_body, "strategy page does not render SMTP fields")
+        assert_true("<h2>邮件配置</h2>" in mail_body, "mail page shows mail configuration")
+        assert_true("ops2@example.com" in mail_body, "mail page displays non-secret mail fields")
+        assert_true("secret-pass" not in mail_body, "mail page does not echo SMTP password")
+        actions = mail_body[mail_body.index('<div class="actions form-actions-right">') : mail_body.index("</div>", mail_body.index('<div class="actions form-actions-right">'))]
+        assert_true('formaction="/mail/test"' in actions, "mail page has a test mail button")
+        assert_true(actions.index("发送测试邮件") < actions.index("保存邮件配置"), "test button is left of save button")
+        assert_true(".form-actions-right { justify-content:flex-end;" in mail_body, "mail page actions are aligned right")
+    finally:
+        cleanup(base)
+
+
+def test_mail_test_saves_form_and_sends_detection_mail():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        calls = []
+        old_send = admin.send_notification
+        try:
+            admin.send_notification = lambda subject, plain, html_body="": calls.append((subject, plain, html_body)) or (1, "")
+
+            class Dummy:
+                def __init__(self):
+                    self.responses = []
+
+                def read_form(self):
+                    return {
+                        "mail_enabled": "yes",
+                        "mail_to": "ops-test@example.com",
+                        "mail_from": "sms@example.com",
+                        "smtp_host": "smtp.example.com",
+                        "smtp_port": "465",
+                        "smtp_user": "sms@example.com",
+                        "smtp_password": "secret-pass",
+                        "smtp_security": "ssl",
+                    }
+
+                def send_html(self, body, status=200, headers=None):
+                    self.responses.append((body.decode("utf-8"), status))
+
+                render_mail_settings = admin.AdminHandler.render_mail_settings
+
+            dummy = Dummy()
+            admin.AdminHandler.handle_mail_test(dummy)
+        finally:
+            admin.send_notification = old_send
+
+        settings = admin.mail_config()
+        assert_true(settings["MAIL_TO"] == "ops-test@example.com", "test action saves submitted mail settings first")
+        assert_true(settings["SMTP_PASSWORD"] == "secret-pass", "test action saves submitted SMTP password")
+        assert_true(calls, "test action sends a detection mail")
+        assert_true("邮件配置测试" in calls[0][0], "test mail subject is clear")
+        assert_true("检测邮件" in calls[0][1], "test mail body explains it is a detection mail")
+        assert_true(dummy.responses and dummy.responses[0][1] == 200, "successful test renders the mail page")
+        assert_true("测试邮件已发送" in dummy.responses[0][0], "successful test shows a clear notice")
+    finally:
+        cleanup(base)
+
+
+def test_send_notification_uses_database_smtp_settings():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        admin.save_mail_settings(
+            {
+                "mail_enabled": "yes",
+                "mail_to": "ops@example.com",
+                "mail_from": "sms@example.com",
+                "smtp_host": "smtp.example.com",
+                "smtp_port": "465",
+                "smtp_user": "sms@example.com",
+                "smtp_password": "secret-pass",
+                "smtp_security": "ssl",
+            }
+        )
+        calls = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=0, context=None):
+                calls.append(("connect", host, port, timeout, bool(context)))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def login(self, user, password):
+                calls.append(("login", user, password))
+
+            def send_message(self, msg):
+                calls.append(("send", msg["From"], msg["To"], msg["Subject"], msg.get_content()))
+
+        old_ssl = admin.smtplib.SMTP_SSL
+        try:
+            admin.smtplib.SMTP_SSL = FakeSMTP
+            ok, err = admin.send_notification("Test subject", "plain body")
+        finally:
+            admin.smtplib.SMTP_SSL = old_ssl
+
+        assert_true(ok == 1 and err == "", "database SMTP config sends mail")
+        assert_true(calls[0] == ("connect", "smtp.example.com", 465, 30, True), "SMTP SSL connection uses database host and port")
+        assert_true(("login", "sms@example.com", "secret-pass") in calls, "SMTP login uses database credentials")
+        send_call = [call for call in calls if call[0] == "send"][0]
+        assert_true(send_call[1] == "sms@example.com", "message sender comes from database")
+        assert_true(send_call[2] == "ops@example.com", "message recipient comes from database")
+        assert_true("plain body" in send_call[4], "message body is sent")
+    finally:
+        cleanup(base)
+
+
+def test_reconcile_submitted_outbox_timeout_removes_file_and_marks_timeout():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        outbox = admin.BASE / "spool" / "outbox"
+        outbox.mkdir(parents=True)
+        outbox_file = outbox / "OUTC20260610_203858_00_+8613003630212_sms0.smsbackup"
+        outbox_file.write_text("queued sms", encoding="utf-8")
+        item_id = admin.create_immediate_outbound("+8613003630212", "stale queued", admin.now_text())
+        submitted_at = (dt.datetime.now().astimezone() - dt.timedelta(minutes=admin.SUBMITTED_SEND_TIMEOUT_MINUTES + 1)).strftime(TIME_FORMAT)
+        with admin.db() as conn:
+            conn.execute(
+                """
+                UPDATE outbound_sms
+                SET status = 'submitted', attempts = 1, submitted_at = ?, updated_at = ?,
+                    command_output = ?
+                WHERE id = ?
+                """,
+                (submitted_at, submitted_at, f"Written message with ID {outbox_file}", item_id),
+            )
+        admin.reconcile_submitted_outbounds()
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+        assert_true(not outbox_file.exists(), "timed-out outbox file is removed to avoid later batch sending")
+        assert_true(row["status"] == "send_timeout", "timed-out submitted SMS is marked as send timeout")
+        assert_true("已从 outbox 移除" in row["last_error"], "timeout explains that the smsd queue file was removed")
+    finally:
+        cleanup(base)
+
+
+def test_reconcile_submitted_sent_file_marks_sent():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        outbox = admin.BASE / "spool" / "outbox"
+        sent = admin.BASE / "spool" / "sent"
+        outbox.mkdir(parents=True)
+        sent.mkdir(parents=True)
+        filename = "OUTC20260610_203858_00_+8613003630212_sms0.smsbackup"
+        sent_file = sent / filename
+        sent_file.write_text("sent sms", encoding="utf-8")
+        item_id = admin.create_immediate_outbound("+8613003630212", "sent queued", admin.now_text())
+        submitted_at = (dt.datetime.now().astimezone() - dt.timedelta(minutes=1)).strftime(TIME_FORMAT)
+        with admin.db() as conn:
+            conn.execute(
+                """
+                UPDATE outbound_sms
+                SET status = 'submitted', attempts = 1, submitted_at = ?, updated_at = ?,
+                    command_output = ?
+                WHERE id = ?
+                """,
+                (submitted_at, submitted_at, f"Written message with ID {outbox / filename}", item_id),
+            )
+        admin.reconcile_submitted_outbounds()
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+        assert_true(row["status"] == "sent", "submitted SMS with sent spool file is marked sent")
+        assert_true(row["last_error"] == "", "sent row does not keep an error")
+    finally:
+        cleanup(base)
+
+
+def test_planned_sms_sent_success_sends_mail_notification():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        strategy = admin.get_default_strategy()
+        plan_id = admin.create_send_plan("Success plan", "+8613003630212", "plan sent ok", admin.now_text(), strategy["id"])
+        outbox = admin.BASE / "spool" / "outbox"
+        sent = admin.BASE / "spool" / "sent"
+        outbox.mkdir(parents=True)
+        sent.mkdir(parents=True)
+        filename = "OUTC20260610_203858_00_+8613003630212_sms0.smsbackup"
+        sent_file = sent / filename
+        sent_file.write_text("sent sms", encoding="utf-8")
+        submitted_at = (dt.datetime.now().astimezone() - dt.timedelta(minutes=1)).strftime(TIME_FORMAT)
+        with admin.db() as conn:
+            outbound_id = conn.execute("SELECT outbound_id FROM send_plans WHERE id = ?", (plan_id,)).fetchone()["outbound_id"]
+            conn.execute(
+                """
+                UPDATE outbound_sms
+                SET status = 'submitted', attempts = 1, submitted_at = ?, updated_at = ?,
+                    command_output = ?
+                WHERE id = ?
+                """,
+                (submitted_at, submitted_at, f"Written message with ID {outbox / filename}", outbound_id),
+            )
+        calls = []
+        old_send = admin.send_notification
+        try:
+            admin.send_notification = lambda subject, plain, html_body="": calls.append((subject, plain, html_body)) or (1, "")
+            admin.reconcile_submitted_outbounds()
+        finally:
+            admin.send_notification = old_send
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (outbound_id,)).fetchone()
+        assert_true(row["status"] == "sent", "planned submitted SMS is marked sent")
+        assert_true(row["final_notified"] == 1, "successful planned SMS records mail notification")
+        assert_true(calls, "successful planned SMS sends a mail notification")
+        assert_true("短信发送成功" in calls[0][0], "success mail subject is clear")
+        assert_true(f"计划 ID: #{plan_id}" in calls[0][1], "success mail includes plan id")
+        assert_true("plan sent ok" in calls[0][1], "success mail includes SMS text")
+    finally:
+        cleanup(base)
+
+
+def test_process_one_due_blocks_no_sim_before_injecting():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        item_id = admin.create_immediate_outbound("+8613003630212", "do not queue", admin.now_text())
+        called = []
+        old_health = admin.read_smsd_health_status
+        old_submit = admin.submit_sms
+        try:
+            admin.read_smsd_health_status = lambda: admin.sim_problem_status("未识别（无法访问 SIM 卡）", "smsd 无法访问 SIM 卡")
+            admin.submit_sms = lambda row, timeout: called.append(row["id"]) or ("submitted", "should not happen")
+            admin.process_one_due(item_id, ignore_interval=True)
+        finally:
+            admin.read_smsd_health_status = old_health
+            admin.submit_sms = old_submit
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+        assert_true(called == [], "no-SIM preflight blocks gammu-smsd-inject")
+        assert_true(row["status"] == "failed", "immediate no-SIM send fails without entering smsd outbox")
+        assert_true("未写入 smsd 发送队列" in row["last_error"], "failure explains that no outbox file was created")
+    finally:
+        cleanup(base)
+
+
+def test_process_one_due_pve_dispatch_creates_idempotent_job_without_local_gammu():
+    old_mode = os.environ.get("SMS_DISPATCH_MODE")
+    os.environ["SMS_DISPATCH_MODE"] = "pve"
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        item_id = admin.create_immediate_outbound("+8613003630212", "dispatch me", admin.now_text())
+        called = []
+        old_submit = admin.submit_sms
+        try:
+            admin.submit_sms = lambda row, timeout: called.append(row["id"]) or ("failed", "local gammu should not run")
+            admin.process_one_due(item_id, ignore_interval=True)
+        finally:
+            admin.submit_sms = old_submit
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+            jobs = conn.execute("SELECT * FROM sms_dispatch_jobs WHERE outbound_id = ?", (item_id,)).fetchall()
+        assert_true(called == [], "PVE dispatch mode does not call local gammu-smsd-inject")
+        assert_true(row["status"] == "dispatching", "outbound moves to dispatching while PVE owns execution")
+        assert_true(row["dispatch_job_id"], "outbound keeps the dispatch job id")
+        assert_true(len(jobs) == 1, "one dispatch job is created")
+        assert_true(jobs[0]["status"] == "queued", "dispatch job starts queued for PVE agent")
+        assert_true(jobs[0]["idempotency_key"] == f"outbound:{item_id}:attempt:1", "dispatch job has stable idempotency key")
+    finally:
+        if old_mode is None:
+            os.environ.pop("SMS_DISPATCH_MODE", None)
+        else:
+            os.environ["SMS_DISPATCH_MODE"] = old_mode
+        cleanup(base)
+
+
+def test_cancel_dispatching_sets_cancel_request_without_overwriting_status():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        item_id = admin.create_immediate_outbound("+8613003630212", "cancel while dispatching", admin.now_text())
+        with admin.db() as conn:
+            conn.execute("UPDATE outbound_sms SET status = 'dispatching', updated_at = ? WHERE id = ?", (admin.now_text(), item_id))
+        ok, message = admin.request_cancel_outbound(item_id)
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+        assert_true(ok, "dispatching cancel request is accepted")
+        assert_true("尝试取消" in message, "dispatching cancel explains it is only requested")
+        assert_true(row["status"] == "dispatching", "dispatching status is not overwritten")
+        assert_true(row["cancel_requested"] == 1, "cancel request flag is set")
+        assert_true(row["cancel_requested_at"], "cancel request timestamp is stored")
+    finally:
+        cleanup(base)
+
+
+def test_cancel_submitted_and_sent_are_rejected():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        submitted_id = admin.create_immediate_outbound("+8613003630212", "submitted", admin.now_text())
+        sent_id = admin.create_immediate_outbound("+8613003630213", "sent", admin.now_text())
+        with admin.db() as conn:
+            conn.execute("UPDATE outbound_sms SET status = 'submitted', updated_at = ? WHERE id = ?", (admin.now_text(), submitted_id))
+            conn.execute("UPDATE outbound_sms SET status = 'sent', updated_at = ? WHERE id = ?", (admin.now_text(), sent_id))
+        submitted_ok, submitted_message = admin.request_cancel_outbound(submitted_id)
+        sent_ok, sent_message = admin.request_cancel_outbound(sent_id)
+        with admin.db() as conn:
+            submitted = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (submitted_id,)).fetchone()
+            sent = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (sent_id,)).fetchone()
+        assert_true(not submitted_ok, "submitted SMS cannot be cancelled")
+        assert_true("已提交" in submitted_message, "submitted cancel explains it is too late")
+        assert_true(not sent_ok, "sent SMS cannot be cancelled")
+        assert_true("已发送" in sent_message, "sent cancel explains it is too late")
+        assert_true(submitted["status"] == "submitted", "submitted status stays unchanged")
+        assert_true(sent["status"] == "sent", "sent status stays unchanged")
+    finally:
+        cleanup(base)
+
+
+def test_reconcile_dispatch_result_updates_outbound_status():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        item_id = admin.create_immediate_outbound("+8613003630212", "dispatch result", admin.now_text())
+        with admin.db() as conn:
+            conn.execute("UPDATE outbound_sms SET status = 'dispatching', attempts = 1, updated_at = ? WHERE id = ?", (admin.now_text(), item_id))
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+            job_id = admin.create_dispatch_job(conn, row)
+            conn.execute(
+                """
+                UPDATE sms_dispatch_jobs
+                SET status = 'submitted', result_status = 'submitted', result_message = 'AT +CMGS OK',
+                    submitted_at = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (admin.now_text(), admin.now_text(), admin.now_text(), job_id),
+            )
+        admin.reconcile_dispatch_jobs()
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+        assert_true(row["status"] == "submitted", "submitted dispatch result updates outbound status")
+        assert_true(row["submitted_at"], "submitted dispatch result stores submitted time")
+        assert_true(row["command_output"] == "AT +CMGS OK", "dispatch result message is retained")
+    finally:
+        cleanup(base)
+
+
+def test_reconcile_cancelled_dispatch_marks_requested_outbound_cancelled():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        item_id = admin.create_immediate_outbound("+8613003630212", "dispatch cancelled", admin.now_text())
+        with admin.db() as conn:
+            conn.execute(
+                "UPDATE outbound_sms SET status = 'dispatching', attempts = 1, cancel_requested = 1, updated_at = ? WHERE id = ?",
+                (admin.now_text(), item_id),
+            )
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+            job_id = admin.create_dispatch_job(conn, row)
+            conn.execute(
+                """
+                UPDATE sms_dispatch_jobs
+                SET status = 'cancelled', result_status = 'cancelled', result_message = 'cancelled before send',
+                    completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (admin.now_text(), admin.now_text(), job_id),
+            )
+        admin.reconcile_dispatch_jobs()
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (item_id,)).fetchone()
+        assert_true(row["status"] == "cancelled", "cancelled dispatch with cancel request marks outbound cancelled")
+        assert_true("cancelled before send" in row["last_error"], "cancelled dispatch reason is retained")
     finally:
         cleanup(base)
 
@@ -659,6 +2234,7 @@ def test_successful_plan_creates_next_outbound_from_strategy_interval():
     admin, base = load_admin()
     try:
         admin.init_db()
+        scheduled_at = (dt.datetime.now().astimezone() - dt.timedelta(minutes=1)).strftime(TIME_FORMAT)
         with admin.db() as conn:
             cur = conn.execute(
                 """
@@ -670,7 +2246,7 @@ def test_successful_plan_creates_next_outbound_from_strategy_interval():
                 (admin.now_text(), admin.now_text()),
             )
             strategy_id = int(cur.lastrowid)
-        plan_id = admin.create_send_plan("Recurring", "13000000000", "planned again", admin.now_text(), strategy_id)
+        plan_id = admin.create_send_plan("Recurring", "13000000000", "planned again", scheduled_at, strategy_id)
         with admin.db() as conn:
             original_plan = conn.execute("SELECT * FROM send_plans WHERE id = ?", (plan_id,)).fetchone()
             original_outbound_id = original_plan["outbound_id"]
@@ -683,7 +2259,7 @@ def test_successful_plan_creates_next_outbound_from_strategy_interval():
             sent = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (original_outbound_id,)).fetchone()
             next_row = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (plan["outbound_id"],)).fetchone()
             plan_count = conn.execute("SELECT COUNT(*) AS c FROM send_plans WHERE id = ?", (plan_id,)).fetchone()["c"]
-        submitted_at = dt.datetime.strptime(sent["submitted_at"], TIME_FORMAT)
+        original_scheduled = dt.datetime.strptime(original_plan["scheduled_at"], TIME_FORMAT)
         next_scheduled = dt.datetime.strptime(next_row["scheduled_at"], TIME_FORMAT)
         assert_true(sent["status"] == "submitted", "original plan outbound is submitted")
         assert_true(plan_count == 1, "recurring send stays inside the same plan")
@@ -692,7 +2268,7 @@ def test_successful_plan_creates_next_outbound_from_strategy_interval():
         assert_true(next_row["status"] == "queued", "next planned send is queued")
         assert_true(next_row["send_type"] == "plan", "next planned send keeps plan type")
         assert_true(next_row["plan_id"] == plan_id, "next planned send links to the same plan")
-        assert_true(next_scheduled - submitted_at == dt.timedelta(minutes=3), "next send uses strategy send interval")
+        assert_true(next_scheduled - original_scheduled == dt.timedelta(minutes=3), "next send uses planned time plus strategy interval")
     finally:
         cleanup(base)
 
@@ -793,6 +2369,86 @@ def test_archive_send_plan_keeps_plan_visible_after_send_history():
         cleanup(base)
 
 
+def test_update_send_plan_syncs_only_current_queued_outbound():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        strategy = admin.get_default_strategy()
+        plan_id = admin.create_send_plan("Editable plan", "13000000000", "old body", admin.now_text(), strategy["id"])
+        with admin.db() as conn:
+            outbound_id = conn.execute("SELECT outbound_id FROM send_plans WHERE id = ?", (plan_id,)).fetchone()["outbound_id"]
+
+        admin.update_send_plan(plan_id, "+8613000000001", "new body", "+86", "13000000001")
+
+        with admin.db() as conn:
+            plan = conn.execute("SELECT * FROM send_plans WHERE id = ?", (plan_id,)).fetchone()
+            outbound = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (outbound_id,)).fetchone()
+        assert_true(plan["destination"] == "+8613000000001", "plan destination is updated")
+        assert_true(plan["country_code"] == "+86", "plan country code is updated separately")
+        assert_true(plan["phone_number"] == "13000000001", "plan phone number is updated separately")
+        assert_true(plan["text"] == "new body", "plan text is updated")
+        assert_true(outbound["destination"] == "+8613000000001", "current queued outbound destination follows plan")
+        assert_true(outbound["text"] == "new body", "current queued outbound text follows plan")
+
+        with admin.db() as conn:
+            conn.execute("UPDATE outbound_sms SET status = 'submitted', updated_at = ? WHERE id = ?", (admin.now_text(), outbound_id))
+        admin.update_send_plan(plan_id, "+8613000000002", "final body", "+86", "13000000002")
+        with admin.db() as conn:
+            plan = conn.execute("SELECT * FROM send_plans WHERE id = ?", (plan_id,)).fetchone()
+            outbound = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (outbound_id,)).fetchone()
+        assert_true(plan["destination"] == "+8613000000002", "unarchived plan remains editable after current outbound leaves queue")
+        assert_true(plan["phone_number"] == "13000000002", "unarchived plan keeps edited phone number separately")
+        assert_true(plan["text"] == "final body", "unarchived plan text remains editable")
+        assert_true(outbound["destination"] == "+8613000000001", "non-queued outbound destination is not rewritten")
+        assert_true(outbound["text"] == "new body", "non-queued outbound text is not rewritten")
+
+        admin.archive_send_plan(plan_id)
+        try:
+            admin.update_send_plan(plan_id, "+8613000000003", "archived body")
+        except ValueError as exc:
+            assert_true("已归档" in str(exc), "archived plan update reports clear error")
+        else:
+            raise AssertionError("archived plan update should be blocked")
+    finally:
+        cleanup(base)
+
+
+def test_plan_detail_and_edit_modals_are_separate_for_unarchived_plans_only():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        strategy = admin.get_default_strategy()
+        active_plan_id = admin.create_send_plan("Editable plan", "13000000000", "editable body", admin.now_text(), strategy["id"])
+        archived_plan_id = admin.create_send_plan("Archived plan", "13000000001", "locked body", admin.now_text(), strategy["id"])
+        admin.archive_send_plan(archived_plan_id)
+
+        body = admin.AdminHandler.render_plans(object()).decode("utf-8")
+        active_dialog = body[body.index(f'id="plan-detail-{active_plan_id}"') : body.index("</dialog>", body.index(f'id="plan-detail-{active_plan_id}"'))]
+        active_edit_dialog = body[body.index(f'id="plan-edit-{active_plan_id}"') : body.index("</dialog>", body.index(f'id="plan-edit-{active_plan_id}"'))]
+        archived_dialog = body[body.index(f'id="plan-detail-{archived_plan_id}"') : body.index("</dialog>", body.index(f'id="plan-detail-{archived_plan_id}"'))]
+
+        first_detail_pair = active_dialog[active_dialog.index('<div class="detail-grid">') : active_dialog.index("<b>名称</b>")]
+        assert_true(f"<b>ID</b><span>#{active_plan_id}</span>" in first_detail_pair, "plan detail shows ID as the first row")
+        assert_true(f'action="/plans/{active_plan_id}/update"' not in active_dialog, "plan detail stays read-only")
+        assert_true(f"plan-edit-{active_plan_id}" in body, "unarchived plan has a separate edit modal")
+        assert_true(f'action="/plans/{active_plan_id}/update"' in active_edit_dialog, "separate edit modal posts plan updates")
+        assert_true("<label>区号</label>" in active_edit_dialog, "plan edit modal exposes country code")
+        assert_true('name="country_code"' in active_edit_dialog, "plan edit modal has country code input")
+        assert_true('value="+86"' in active_edit_dialog, "plan edit modal pre-fills stored country code")
+        assert_true("<label>目标号码</label>" in active_edit_dialog, "plan edit modal exposes phone number")
+        assert_true('name="destination"' in active_edit_dialog, "plan edit modal keeps destination field for phone number")
+        assert_true('value="13000000000"' in active_edit_dialog, "plan edit modal pre-fills stored phone number")
+        assert_true("<label>短信内容</label>" in active_edit_dialog, "plan edit modal exposes SMS content")
+        assert_true("editable body" in active_edit_dialog, "plan edit modal pre-fills SMS content")
+        assert_true('<div class="actions modal-actions">' in active_edit_dialog, "edit modal uses bottom-right modal actions")
+        assert_true(active_edit_dialog.index("关闭") < active_edit_dialog.index("保存修改"), "edit modal shows close before save")
+        assert_true(f'plan-edit-{archived_plan_id}' not in body, "archived plan does not have an edit modal")
+        assert_true(f'action="/plans/{archived_plan_id}/update"' not in archived_dialog, "archived plan detail does not have update form")
+        assert_true("locked body" in archived_dialog, "archived plan still shows read-only content")
+    finally:
+        cleanup(base)
+
+
 def test_plan_list_uses_modal_counts_next_time_and_archive_action_for_history():
     admin, base = load_admin()
     try:
@@ -832,13 +2488,16 @@ def test_plan_list_uses_modal_counts_next_time_and_archive_action_for_history():
         assert_true(f"plan-detail-{plan_id}" in body, "plan detail modal is present")
         assert_true(f'/plans/{plan_id}/archive' in body, "plan with send history has archive action")
         assert_true(f'/plans/{plan_id}/delete' not in body, "plan with send history does not show delete action")
-        assert_true("<th>失败次数</th>" in table, "plan list shows failure count")
-        assert_true("<th>成功次数</th>" in table, "plan list shows success count")
+        assert_true("<th>发送次数</th>" in table, "plan list merges send counters into one column")
+        assert_true("<th>失败次数</th>" not in table, "plan list no longer has a separate failure count column")
+        assert_true("<th>成功次数</th>" not in table, "plan list no longer has a separate success count column")
         assert_true("<th>下次发送</th>" in table, "plan list shows next send time")
         assert_true("<th>内容</th>" not in table, "plan list hides content column")
         assert_true("<th>错误</th>" not in table, "plan list hides error column")
-        assert_true('class="count-pill failure">1</span>' in body, "failure count is red")
-        assert_true('class="count-pill success">1</span>' in body, "success count is green")
+        send_count_cell = table[table.index('class="send-counts"') : table.index("</td>", table.index('class="send-counts"'))]
+        assert_true('class="count-pill failure">1</span>' in send_count_cell, "failure count is red")
+        assert_true('class="count-pill success">1</span>' in send_count_cell, "success count is green")
+        assert_true(send_count_cell.index('failure">1') < send_count_cell.index('success">1'), "failure count appears before success count")
         assert_true(str(current_id) in body, "current outbound id still appears in detail context")
     finally:
         cleanup(base)
@@ -860,6 +2519,30 @@ def test_plan_list_shows_delete_for_plan_without_send_history_and_hides_deleted(
         cleanup(base)
 
 
+def test_plan_list_paginates_ten_per_page_below_table():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        strategy = admin.get_default_strategy()
+        for i in range(12):
+            admin.create_send_plan(f"Paged plan {i}", f"130000001{i:02d}", f"body {i}", admin.now_text(), strategy["id"])
+
+        class Dummy:
+            path = "/plans?page=2"
+
+        body = admin.AdminHandler.render_plans(Dummy()).decode("utf-8")
+        table_start = body.index("<h2>发送计划</h2>")
+        table_end = body.index("</table>", table_start)
+        table = body[table_start:table_end]
+        pager_pos = body.index("共 12 条")
+
+        assert_true(table.count("<tr><td>#") == 2, "plans page shows ten rows per page")
+        assert_true("page=1" in body, "plans pagination links to the previous page")
+        assert_true(table_end < pager_pos, "plans pagination sits below the table")
+    finally:
+        cleanup(base)
+
+
 def test_outbound_page_uses_send_list_title_and_paginates_ten_per_page():
     admin, base = load_admin()
     try:
@@ -877,6 +2560,7 @@ def test_outbound_page_uses_send_list_title_and_paginates_ten_per_page():
         assert_true("<h2>最近发送</h2>" not in body, "outbound page title is send list")
         assert_true(table.count("<tr><td>#") == 2, "outbound page shows ten rows per page")
         assert_true("page=1" in body, "pagination keeps previous page link")
+        assert_true(body.index("</table>", body.index("<h2>发送列表</h2>")) < body.index("共 12 条"), "outbound pagination sits below the table")
     finally:
         cleanup(base)
 
@@ -940,7 +2624,97 @@ def test_outbound_filters_are_compact_right_aligned_and_plan_rows_do_not_cancel_
         with admin.db() as conn:
             plan_outbound_id = conn.execute("SELECT outbound_id FROM send_plans WHERE id = ?", (plan_id,)).fetchone()["outbound_id"]
         assert_true(f'/outbound/{plan_outbound_id}/cancel' not in body, "planned queued send cannot be cancelled from outbound list")
-        assert_true("计划列表操作" in body, "planned queued row directs cancellation to plan list")
+        assert_true("计划列表操作" not in body, "planned queued row leaves the operation area empty")
+    finally:
+        cleanup(base)
+
+
+def test_outbound_list_moves_error_into_detail_modal_and_shows_scheduled_minute():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        raw_time = "2026-06-10 22:00:00 +0800"
+        display_minute = "2026/06/10 22:00"
+        outbound_id = admin.create_immediate_outbound("13000000000", "detail body", raw_time)
+        with admin.db() as conn:
+            conn.execute(
+                """
+                UPDATE outbound_sms
+                SET created_at = ?, updated_at = ?, scheduled_at = ?,
+                    next_attempt_at = ?, last_error = ?
+                WHERE id = ?
+                """,
+                (raw_time, raw_time, raw_time, raw_time, "modem not ready", outbound_id),
+            )
+
+        class Dummy:
+            path = "/outbound"
+            table_outbound = admin.AdminHandler.table_outbound
+
+        body = admin.AdminHandler.render_outbound(Dummy()).decode("utf-8")
+        table = body[body.index("<h2>发送列表</h2>") : body.index("</table>", body.index("<h2>发送列表</h2>"))]
+        dialog = body[body.index(f'id="outbound-detail-{outbound_id}"') : body.index("</dialog>", body.index(f'id="outbound-detail-{outbound_id}"'))]
+
+        assert_true("<th>错误</th>" not in table, "outbound list no longer has an error column")
+        assert_true("modem not ready" not in table, "outbound list hides row error text")
+        assert_true("详情" in table, "outbound list exposes a detail action")
+        assert_true("<b>计划发送时间</b>" in dialog, "detail modal adds scheduled send time")
+        assert_true(
+            f"<b>计划发送时间</b><span>{display_minute}</span>" in dialog,
+            "scheduled send time is shown to minute precision",
+        )
+        assert_true(
+            "<b>计划发送时间</b><span>2026/06/10 22:00:00</span>" not in dialog,
+            "scheduled send time does not show seconds",
+        )
+        assert_true("modem not ready" in dialog, "detail modal contains row error text")
+        assert_true("detail body" in dialog, "detail modal contains message text")
+    finally:
+        cleanup(base)
+
+
+def test_admin_pages_display_times_in_js_style_format():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        raw_time = "2026-06-10 22:00:00 +0800"
+        display_time = "2026/06/10 22:00:00"
+        display_minute = "2026/06/10 22:00"
+        strategy = admin.get_default_strategy()
+        outbound_id = admin.create_immediate_outbound("13000000000", "time body", raw_time)
+        plan_id = admin.create_send_plan("Time plan", "13000000001", "planned time", raw_time, strategy["id"])
+        with admin.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO inbound_sms
+                  (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded)
+                VALUES (?, '+8613000000000', 'time inbound', '', '', 1, 1, 0)
+                """,
+                (raw_time,),
+            )
+            conn.execute("UPDATE outbound_sms SET created_at = ?, updated_at = ? WHERE id = ?", (raw_time, raw_time, outbound_id))
+
+        class InboundDummy:
+            path = "/inbound"
+            table_inbound = admin.AdminHandler.table_inbound
+
+        class OutboundDummy:
+            path = "/outbound"
+            table_outbound = admin.AdminHandler.table_outbound
+
+        inbound_body = admin.AdminHandler.render_inbound(InboundDummy()).decode("utf-8")
+        outbound_body = admin.AdminHandler.render_outbound(OutboundDummy()).decode("utf-8")
+        plans_body = admin.AdminHandler.render_plans(object()).decode("utf-8")
+
+        assert_true(display_time in inbound_body, "inbound page displays slash-formatted receive time")
+        assert_true(display_time in outbound_body, "outbound page displays slash-formatted created time")
+        assert_true(display_minute in plans_body, "plans page displays scheduled time to the minute")
+        assert_true(raw_time not in inbound_body, "inbound page hides raw timezone time")
+        assert_true(raw_time not in outbound_body, "outbound page hides raw timezone time")
+        assert_true(raw_time not in plans_body, "plans page hides raw timezone time")
+        plan_table = plans_body[plans_body.index("<h2>发送计划</h2>") : plans_body.index("</table>", plans_body.index("<h2>发送计划</h2>"))]
+        assert_true(display_time not in plan_table, "plan list next send time hides seconds")
+        assert_true(f"plan-detail-{plan_id}" in plans_body, "plan detail still renders after time formatting")
     finally:
         cleanup(base)
 
@@ -985,19 +2759,226 @@ def test_inbound_page_filters_by_sender_keyword_and_forward_status():
         cleanup(base)
 
 
+def test_inbound_page_paginates_ten_per_page_and_preserves_filters():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        with admin.db() as conn:
+            for i in range(12):
+                conn.execute(
+                    """
+                    INSERT INTO inbound_sms
+                      (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded)
+                    VALUES (?, ?, ?, '', '', 1, 1, 1)
+                    """,
+                    (admin.now_text(), f"+861300000{i:02d}", f"invoice page {i}",),
+                )
+            conn.execute(
+                """
+                INSERT INTO inbound_sms
+                  (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded)
+                VALUES (?, '+8613999999999', 'other text', '', '', 1, 1, 0)
+                """,
+                (admin.now_text(),),
+            )
+
+        class Dummy:
+            path = "/inbound?sender=130000&forwarded=1&page=2"
+            table_inbound = admin.AdminHandler.table_inbound
+
+        body = admin.AdminHandler.render_inbound(Dummy()).decode("utf-8")
+        table_start = body.index("<h2>接收列表</h2>")
+        table_end = body.index("</table>", table_start)
+        table = body[table_start:table_end]
+        pager_pos = body.index("共 12 条")
+
+        assert_true(table.count("<tr><td>#") == 2, "inbound page shows ten rows per page")
+        assert_true("sender=130000" in body and "forwarded=1" in body and "page=1" in body, "inbound pagination preserves filters")
+        assert_true(table_end < pager_pos, "inbound pagination sits below the table")
+    finally:
+        cleanup(base)
+
+
+def test_forward_pending_inbound_sms_sends_mail_and_updates_status():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        with admin.db() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO inbound_sms
+                  (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded, forward_error)
+                VALUES (?, '10000', '账单提醒', 'pve-cmgl-8', 'pve-radio-agent', 1, 1, 0, '')
+                """,
+                (admin.now_text(),),
+            )
+            record_id = int(cur.lastrowid)
+        calls = []
+        admin.send_notification = lambda subject, plain, html_body="": calls.append((subject, plain, html_body)) or (1, "")
+        admin.forward_pending_inbound_sms()
+        with admin.db() as conn:
+            row = conn.execute("SELECT * FROM inbound_sms WHERE id = ?", (record_id,)).fetchone()
+        assert_true(calls, "pending inbound SMS triggers mail notification")
+        assert_true("新短信提醒" in calls[0][0], "inbound notification uses SMS subject")
+        assert_true("账单提醒" in calls[0][1], "plain mail body contains SMS text")
+        assert_true(row["forwarded"] == 1, "successful inbound mail marks row forwarded")
+        assert_true(row["forward_error"] == "", "successful inbound mail clears forward error")
+    finally:
+        cleanup(base)
+
+
+def test_forward_inbound_sms_by_id_only_sends_target_row():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+        with admin.db() as conn:
+            first = conn.execute(
+                """
+                INSERT INTO inbound_sms
+                  (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded, forward_error)
+                VALUES (?, '10000', 'first', 'first-id', 'pve', 1, 1, 0, '')
+                """,
+                (admin.now_text(),),
+            )
+            second = conn.execute(
+                """
+                INSERT INTO inbound_sms
+                  (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded, forward_error)
+                VALUES (?, '10001', 'second', 'second-id', 'pve', 1, 1, 0, '')
+                """,
+                (admin.now_text(),),
+            )
+            first_id = int(first.lastrowid)
+            second_id = int(second.lastrowid)
+        calls = []
+        admin.send_notification = lambda subject, plain, html_body="": calls.append((subject, plain, html_body)) or (1, "")
+        admin.forward_inbound_sms_by_id(second_id)
+        with admin.db() as conn:
+            first_row = conn.execute("SELECT * FROM inbound_sms WHERE id = ?", (first_id,)).fetchone()
+            second_row = conn.execute("SELECT * FROM inbound_sms WHERE id = ?", (second_id,)).fetchone()
+        assert_true(len(calls) == 1, "inbound event forwards one row")
+        assert_true("second" in calls[0][1], "event forwards the requested row")
+        assert_true(first_row["forwarded"] == 0, "other pending rows remain for fallback polling")
+        assert_true(second_row["forwarded"] == 1, "requested row is marked forwarded")
+    finally:
+        cleanup(base)
+
+
+def test_parse_inbound_notification_payload_accepts_json_and_plain_id():
+    admin, base = load_admin()
+    try:
+        assert_true(admin.parse_inbound_notification_payload('{"inbound_id": 12}') == 12, "JSON inbound id is parsed")
+        assert_true(admin.parse_inbound_notification_payload("13") == 13, "plain inbound id is parsed")
+        assert_true(admin.parse_inbound_notification_payload("{}") is None, "missing id is ignored")
+    finally:
+        cleanup(base)
+
+
+def test_inbound_notification_loop_keeps_idle_subscription_without_error_reconnect():
+    admin, base = load_admin()
+
+    class StopEvent:
+        def __init__(self):
+            self.done = False
+
+        def is_set(self):
+            return self.done
+
+        def wait(self, _seconds):
+            self.done = True
+            return True
+
+    class FakeSock:
+        def __init__(self):
+            self.closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, _payload):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class FakeSelect:
+        @staticmethod
+        def select(_readers, _writers, _errors, _timeout):
+            stop_event.done = True
+            return [], [], []
+
+    stop_event = StopEvent()
+    sock = FakeSock()
+    logs = []
+    reads = []
+    try:
+        admin.sms_redis_url = lambda: "redis://127.0.0.1:6379/0"
+        admin.redis_connect = lambda _url, timeout=5: (sock, object())
+
+        def read_value(_reader):
+            reads.append(1)
+            if len(reads) == 1:
+                return ["subscribe", "sms:inbound", 1]
+            raise OSError("cannot read from timed out object")
+
+        admin.redis_read_value = read_value
+        admin.log_worker = logs.append
+        admin.select = FakeSelect
+
+        admin.inbound_notification_loop(stop_event)
+
+        assert_true(reads == [1], "idle subscription reads only the subscribe acknowledgement")
+        assert_true(logs == ["redis_subscribed channel=sms:inbound"], "idle subscription does not log reconnect errors")
+        assert_true(sock.closed, "idle subscription closes the socket during shutdown")
+    finally:
+        cleanup(base)
+
+
+def test_worker_interval_aligns_queue_scan_to_next_minute():
+    previous = os.environ.get("SMS_WORKER_INTERVAL_SECONDS")
+    admin, base = load_admin()
+    try:
+        now = dt.datetime(2026, 6, 11, 23, 0, 10, 500000)
+        assert_true(admin.worker_interval_seconds(now) == 49.5, "worker waits until the next minute boundary")
+        now = dt.datetime(2026, 6, 11, 23, 0, 59, 900000)
+        assert_true(round(admin.worker_interval_seconds(now), 1) == 0.1, "worker can wake just after the next minute starts")
+        now = dt.datetime(2026, 6, 11, 23, 1, 0, 0)
+        assert_true(admin.worker_interval_seconds(now) == 0.0, "worker can scan immediately at a minute boundary")
+        os.environ["SMS_WORKER_INTERVAL_SECONDS"] = "2.5"
+        assert_true(admin.worker_interval_seconds(now) == 0.0, "worker queue scan interval is no longer sub-minute configurable")
+    finally:
+        if previous is None:
+            os.environ.pop("SMS_WORKER_INTERVAL_SECONDS", None)
+        else:
+            os.environ["SMS_WORKER_INTERVAL_SECONDS"] = previous
+        cleanup(base)
+
+
 def test_create_send_plan_creates_planned_outbound():
     admin, base = load_admin()
     try:
         admin.init_db()
         strategy = admin.get_default_strategy()
         scheduled_at = (dt.datetime.now().astimezone() + dt.timedelta(minutes=20)).strftime(TIME_FORMAT)
-        plan_id = admin.create_send_plan("Morning check", "13000000000", "planned hello", scheduled_at, strategy["id"])
+        plan_id = admin.create_send_plan(
+            "Morning check",
+            "+8613000000000",
+            "planned hello",
+            scheduled_at,
+            strategy["id"],
+            "+86",
+            "13000000000",
+        )
         with admin.db() as conn:
             plan = conn.execute("SELECT * FROM send_plans WHERE id = ?", (plan_id,)).fetchone()
             outbound = conn.execute("SELECT * FROM outbound_sms WHERE id = ?", (plan["outbound_id"],)).fetchone()
         assert_true(plan["strategy_id"] == strategy["id"], "plan records strategy id")
+        assert_true(plan["country_code"] == "+86", "plan stores country code separately")
+        assert_true(plan["phone_number"] == "13000000000", "plan stores phone number separately")
+        assert_true(plan["destination"] == "+8613000000000", "plan stores combined destination for sending")
         assert_true(outbound["send_type"] == "plan", "planned outbound uses plan type")
         assert_true(outbound["plan_id"] == plan_id, "planned outbound links back to plan")
+        assert_true(outbound["destination"] == "+8613000000000", "planned outbound uses combined destination")
         assert_true(outbound["scheduled_at"] == scheduled_at, "planned outbound keeps scheduled time")
     finally:
         cleanup(base)
@@ -1005,26 +2986,73 @@ def test_create_send_plan_creates_planned_outbound():
 
 def main():
     tests = [
+        test_postgres_initial_migration_contains_dispatch_and_cancel_fields,
+        test_postgres_migration_adds_send_plan_phone_parts_to_existing_tables,
+        test_dockerfile_sets_admin_container_timezone,
+        test_pve_agent_parses_unread_cmgl_messages,
+        test_pve_agent_dispatch_uses_gammu_smsd_inject,
+        test_pve_agent_send_sms_gammu_marks_sent_when_smsd_moves_spool_file,
+        test_pve_agent_status_reports_failed_smsd_over_stale_monitor_memory,
+        test_pve_agent_status_reports_active_smsd_init_errors_over_empty_monitor_identity,
+        test_pve_agent_status_checks_at_presence_over_stale_monitor_imsi,
+        test_pve_agent_status_checks_mbim_presence_over_stale_monitor_imsi,
+        test_pve_agent_status_checks_mbim_presence_over_empty_monitor_identity,
+        test_pve_agent_status_reads_phone_number_from_mbim,
+        test_pve_agent_status_builds_e164_for_uk_local_mbim_number,
+        test_pve_agent_status_checks_at_presence_when_smsd_is_inactive,
+        test_pve_watchdog_treats_empty_monitor_imsi_as_not_ready,
+        test_pve_watchdog_prefers_mbim_presence_over_stale_monitor_imsi,
+        test_pve_watchdog_main_does_not_force_wwan_down_when_sim_ready,
+        test_sms_received_hook_can_disable_local_mail_forwarding,
+        test_sms_received_hook_publishes_inbound_notification_when_configured,
+        test_sms_received_hook_defers_and_combines_multipart_within_short_window,
+        test_sms_received_hook_flushes_incomplete_multipart_after_short_window,
         test_strategy_schema_and_default_minutes,
         test_create_outbound_records_type_and_strategy_snapshot,
         test_destination_from_form_applies_country_code,
+        test_split_destination_for_form_separates_known_country_codes,
+        test_destination_parts_from_form_keep_storage_fields_separate,
         test_send_interval_allows_180_days,
         test_delete_strategy_removes_non_default_but_keeps_snapshots,
         test_delete_default_strategy_is_blocked,
         test_dashboard_omits_cost_protection_notice,
+        test_dashboard_sim_status_places_phone_signal_unit_and_data_switch,
+        test_dashboard_sim_error_uses_bad_pill_without_error_detail,
+        test_dashboard_uses_pve_service_label_in_pve_dispatch_mode,
         test_login_page_uses_border_box_sizing,
         test_send_form_uses_default_strategy_and_country_code_field,
         test_plan_form_country_code_and_optional_time,
         test_optional_future_time_allows_blank_for_immediate_send,
-        test_strategy_actions_show_delete_left_and_save_right,
+        test_strategy_page_uses_table_and_modals_without_command_timeout,
+        test_strategy_send_interval_uses_value_and_unit_ui,
+        test_strategy_update_preserves_hidden_command_timeout,
+        test_delete_and_archive_list_actions_require_confirmation,
         test_parse_sim_status_output,
         test_parse_smsd_monitor_output,
         test_parse_smsd_monitor_output_shows_missing_sim_and_network_off,
+        test_parse_smsd_monitor_output_hides_unknown_negative_signal,
+        test_parse_smsd_health_output_reports_recent_no_sim,
+        test_get_sim_status_prefers_smsd_health_issue_over_stale_monitor_memory,
         test_get_sim_status_can_bypass_cache_and_use_smsd_monitor,
         test_get_sim_status_ignores_smsd_database_for_realtime_status,
+        test_get_sim_status_uses_pve_agent_when_configured,
         test_sse_event_formats_json_payload,
+        test_sim_status_stream_payload_prefers_e164_phone_number,
         test_sms_command_uses_unicode_for_chinese_text,
         test_sms_command_keeps_gsm7_without_unicode_flag,
+        test_status_badge_distinguishes_waiting_sent_and_timeout,
+        test_mail_settings_are_saved_in_database_and_password_is_not_echoed,
+        test_mail_test_saves_form_and_sends_detection_mail,
+        test_send_notification_uses_database_smtp_settings,
+        test_reconcile_submitted_outbox_timeout_removes_file_and_marks_timeout,
+        test_reconcile_submitted_sent_file_marks_sent,
+        test_planned_sms_sent_success_sends_mail_notification,
+        test_process_one_due_blocks_no_sim_before_injecting,
+        test_process_one_due_pve_dispatch_creates_idempotent_job_without_local_gammu,
+        test_cancel_dispatching_sets_cancel_request_without_overwriting_status,
+        test_cancel_submitted_and_sent_are_rejected,
+        test_reconcile_dispatch_result_updates_outbound_status,
+        test_reconcile_cancelled_dispatch_marks_requested_outbound_cancelled,
         test_retry_wait_uses_minutes,
         test_normal_send_is_unbound_and_ignores_strategy_interval,
         test_planned_send_is_not_blocked_by_global_submission_interval,
@@ -1033,12 +3061,23 @@ def main():
         test_successful_plan_with_zero_strategy_interval_does_not_create_next_outbound,
         test_delete_send_plan_soft_deletes_only_without_send_history,
         test_archive_send_plan_keeps_plan_visible_after_send_history,
+        test_update_send_plan_syncs_only_current_queued_outbound,
+        test_plan_detail_and_edit_modals_are_separate_for_unarchived_plans_only,
         test_plan_list_uses_modal_counts_next_time_and_archive_action_for_history,
         test_plan_list_shows_delete_for_plan_without_send_history_and_hides_deleted,
+        test_plan_list_paginates_ten_per_page_below_table,
         test_outbound_page_uses_send_list_title_and_paginates_ten_per_page,
         test_outbound_page_filters_by_plan_strategy_status_and_type,
         test_outbound_filters_are_compact_right_aligned_and_plan_rows_do_not_cancel_there,
+        test_outbound_list_moves_error_into_detail_modal_and_shows_scheduled_minute,
+        test_admin_pages_display_times_in_js_style_format,
         test_inbound_page_filters_by_sender_keyword_and_forward_status,
+        test_inbound_page_paginates_ten_per_page_and_preserves_filters,
+        test_forward_pending_inbound_sms_sends_mail_and_updates_status,
+        test_forward_inbound_sms_by_id_only_sends_target_row,
+        test_parse_inbound_notification_payload_accepts_json_and_plain_id,
+        test_inbound_notification_loop_keeps_idle_subscription_without_error_reconnect,
+        test_worker_interval_aligns_queue_scan_to_next_minute,
         test_create_send_plan_creates_planned_outbound,
     ]
     failures = 0

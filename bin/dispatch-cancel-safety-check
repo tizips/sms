@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+import datetime as dt
+import os
+import sys
+import time
+
+
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S %z"
+
+
+def database_url() -> str:
+    return os.environ.get("SMS_DATABASE_URL", "").strip() or os.environ.get("DATABASE_URL", "").strip()
+
+
+def main() -> int:
+    url = database_url()
+    if not url:
+        print("SMS_DATABASE_URL or DATABASE_URL is required", file=sys.stderr)
+        return 2
+    try:
+        import psycopg2
+        import psycopg2.extras
+    except ImportError as exc:
+        raise RuntimeError("python3-psycopg2 is required") from exc
+
+    now = dt.datetime.now().astimezone().strftime(TIME_FORMAT)
+    conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = False
+    cur = conn.cursor()
+    outbound_id = None
+    job_id = None
+    try:
+        cur.execute(
+            """
+            INSERT INTO outbound_sms
+              (created_at, updated_at, destination, text, scheduled_at, next_attempt_at,
+               status, attempts, max_retries, retry_interval_seconds, last_error,
+               command_output, final_notified, send_type, strategy_name,
+               send_interval_minutes, retry_interval_minutes, command_timeout_seconds,
+               cancel_requested, cancel_requested_at)
+            VALUES
+              (%s, %s, %s, %s, %s, %s, 'dispatching', 0, 0, 600, '',
+               '', 0, 'normal', 'Codex safety check', 1, 10, 45, 1, %s)
+            RETURNING id
+            """,
+            (
+                now,
+                now,
+                "00000",
+                "codex cancellation safety check",
+                now,
+                now,
+                now,
+            ),
+        )
+        outbound_id = cur.fetchone()["id"]
+        cur.execute(
+            """
+            INSERT INTO sms_dispatch_jobs
+              (idempotency_key, outbound_id, attempt_no, status, destination, text,
+               created_at, updated_at, cancel_requested)
+            VALUES (%s, %s, 1, 'queued', %s, %s, %s, %s, 1)
+            RETURNING id
+            """,
+            (
+                f"codex-cancel-safety-{outbound_id}",
+                outbound_id,
+                "00000",
+                "codex cancellation safety check",
+                now,
+                now,
+            ),
+        )
+        job_id = cur.fetchone()["id"]
+        conn.commit()
+
+        final = {}
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            cur.execute(
+                "SELECT status, result_status, result_message FROM sms_dispatch_jobs WHERE id = %s",
+                (job_id,),
+            )
+            final = cur.fetchone() or {}
+            if final.get("status") in {"cancelled", "skipped", "failed", "submitted", "sent", "ambiguous"}:
+                break
+
+        print(
+            "safety_check "
+            f"job_id={job_id} outbound_id={outbound_id} "
+            f"status={final.get('status', '')} "
+            f"result={final.get('result_status', '')} "
+            f"message={final.get('result_message', '')}"
+        )
+        if final.get("status") != "cancelled":
+            return 1
+        return 0
+    finally:
+        if job_id is not None:
+            cur.execute("DELETE FROM sms_dispatch_jobs WHERE id = %s", (job_id,))
+        if outbound_id is not None:
+            cur.execute("DELETE FROM outbound_sms WHERE id = %s", (outbound_id,))
+        conn.commit()
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

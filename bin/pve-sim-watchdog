@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+import datetime as dt
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+
+AT_DEV = os.environ.get("PVE_RADIO_AT_DEV", "/dev/wwan0at0")
+MBIM_DEV = os.environ.get("PVE_RADIO_MBIM_DEV", "/dev/wwan0mbim0")
+LOCK_PATH = os.environ.get("PVE_RADIO_LOCK", "/run/pve-radio-agent.lock")
+GAMMU_SMSDRC = os.environ.get("GAMMU_SMSDRC", "/etc/gammu-smsdrc")
+
+
+def now_text() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def log(message: str) -> None:
+    print(f"{now_text()} {message}", file=sys.stderr, flush=True)
+
+
+class RadioLock:
+    def __enter__(self):
+        os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+        self._fh = open(LOCK_PATH, "w", encoding="utf-8")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+def at_command(command: str, timeout: int = 8) -> str:
+    proc = subprocess.Popen(
+        ["socat", "-", f"{AT_DEV},crnl,echo=0,raw"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(command + "\r", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+    return (stdout + "\n" + stderr).strip()
+
+
+def smsd_monitor_status() -> tuple[bool, str]:
+    monitor = "/usr/bin/gammu-smsd-monitor"
+    if not os.path.exists(monitor):
+        return False, "gammu-smsd-monitor not installed"
+    try:
+        result = subprocess.run(
+            [monitor, "-c", GAMMU_SMSDRC, "-d", "0", "-n", "1"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except Exception as exc:
+        return False, f"monitor_error={exc}"
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode != 0:
+        return False, f"monitor_exit={result.returncode} output={output[:500]!r}"
+    values = {}
+    for raw in output.splitlines():
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        values[key.strip().lower()] = value.strip()
+    ready = bool(values.get("imsi"))
+    return ready, f"monitor_ready={ready} output={output[:500]!r}"
+
+
+def mbim_sim_status() -> tuple[str, str]:
+    try:
+        result = subprocess.run(
+            ["mbimcli", "-p", "-d", MBIM_DEV, "--query-subscriber-ready-status"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except Exception as exc:
+        return "", f"mbim_error={exc}"
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode != 0:
+        return "", f"mbim_exit={result.returncode} output={output[:500]!r}"
+    lower = output.lower()
+    if "ready state: 'sim-not-inserted'" in lower:
+        return "missing", f"mbim_ready_state=sim-not-inserted output={output[:500]!r}"
+    if "ready state: 'initialized'" in lower:
+        return "ready", f"mbim_ready_state=initialized output={output[:500]!r}"
+    return "", f"mbim_ready_state=unknown output={output[:500]!r}"
+
+
+def sim_is_ready() -> tuple[bool, str]:
+    presence, mbim_details = mbim_sim_status()
+    if presence == "ready":
+        return True, mbim_details
+    if presence == "missing":
+        return False, mbim_details
+
+    ready, details = smsd_monitor_status()
+    if ready:
+        return ready, details
+    with RadioLock():
+        cpin = at_command("AT+CPIN?", timeout=5)
+        qsimstat = at_command("AT+QSIMSTAT?", timeout=5)
+    ready = "+CPIN: READY" in cpin and ",1" in qsimstat
+    return ready, f"cpin={cpin!r} qsimstat={qsimstat!r}"
+
+
+def force_wwan_down() -> None:
+    try:
+        state = subprocess.run(["ip", "-brief", "link", "show", "wwan0"], capture_output=True, text=True, timeout=3)
+        if " DOWN " not in f" {state.stdout} ":
+            subprocess.run(["ip", "link", "set", "wwan0", "down"], capture_output=True, text=True, timeout=5)
+            log("forced wwan0 down after SIM recovery")
+    except Exception as exc:
+        log(f"wwan0_down_check_error={exc}")
+
+
+def recover_sim() -> None:
+    subprocess.run(["systemctl", "stop", "gammu-smsd.service"], capture_output=True, text=True, timeout=20)
+    with RadioLock():
+        log("SIM abnormal; starting safe CFUN refresh")
+        at_command("AT+CFUN=0", timeout=5)
+        time.sleep(8)
+        at_command("AT+CFUN=1", timeout=8)
+    time.sleep(12)
+    subprocess.run(["systemctl", "start", "quectel-radio-unlock.service"], capture_output=True, text=True, timeout=20)
+    subprocess.run(["systemctl", "start", "gammu-smsd.service"], capture_output=True, text=True, timeout=20)
+    force_wwan_down()
+    ready, details = sim_is_ready()
+    log(f"post_recovery_ready={ready} {details}")
+
+
+def main() -> int:
+    ready, details = sim_is_ready()
+    if ready:
+        log(f"SIM ready; no action. {details}")
+        return 0
+    log(f"SIM not ready; recovery required. {details}")
+    recover_sim()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+import configparser
+import datetime as dt
+import csv
+import fcntl
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+AT_DEV = os.environ.get("PVE_RADIO_AT_DEV", "/dev/wwan0at0")
+MBIM_DEV = os.environ.get("PVE_RADIO_MBIM_DEV", "/dev/wwan0mbim0")
+LOCK_PATH = os.environ.get("PVE_RADIO_LOCK", "/run/pve-radio-agent.lock")
+BIND = os.environ.get("PVE_RADIO_BIND", "0.0.0.0")
+PORT = int(os.environ.get("PVE_RADIO_PORT", "8091"))
+POLL_SECONDS = float(os.environ.get("PVE_RADIO_POLL_SECONDS", "2"))
+DATABASE_URL = os.environ.get("SMS_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
+GAMMU_SMSDRC = os.environ.get("GAMMU_SMSDRC", "/etc/gammu-smsdrc")
+GAMMU_SMSD_SERVICE = os.environ.get("GAMMU_SMSD_SERVICE", "gammu-smsd.service")
+SMSD_HEALTH_LOG_MINUTES = int(os.environ.get("PVE_RADIO_SMSD_HEALTH_LOG_MINUTES", "10"))
+SEND_TIMEOUT_SECONDS = int(os.environ.get("PVE_RADIO_SEND_TIMEOUT_SECONDS", "90"))
+SENT_WAIT_SECONDS = float(os.environ.get("PVE_RADIO_SENT_WAIT_SECONDS", "45"))
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S %z"
+
+
+def configured_smsd_path(option: str, default: str) -> Path:
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(GAMMU_SMSDRC)
+        value = parser.get("smsd", option, fallback=default)
+    except Exception:
+        value = default
+    return Path(value).expanduser()
+
+
+OUTBOX_PATH = configured_smsd_path("OutboxPath", "/var/lib/pve-sms/spool/outbox/")
+SENT_PATH = configured_smsd_path("SentSMSPath", "/var/lib/pve-sms/spool/sent/")
+ERROR_PATH = configured_smsd_path("ErrorSMSPath", "/var/lib/pve-sms/spool/error/")
+
+
+def now_text() -> str:
+    return dt.datetime.now().astimezone().strftime(TIME_FORMAT)
+
+
+def log(message: str) -> None:
+    print(f"{now_text()} {message}", file=sys.stderr, flush=True)
+
+
+def mask_sim_identity(value: str) -> str:
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) <= 10:
+        return digits
+    return f"{digits[:5]}******{digits[-4:]}"
+
+
+def normalize_phone_number(value: str = "") -> str:
+    text = value.strip().strip("'\"")
+    if not text or text.lower() in {"none", "unknown", "n/a"}:
+        return ""
+    if text.startswith("+"):
+        body = text[1:]
+    else:
+        body = text
+    digits = "".join(ch for ch in body if ch.isdigit())
+    if len(digits) < 5 or len(digits) > 20:
+        return ""
+    return f"+{digits}" if text.startswith("+") else digits
+
+
+def parse_mbim_phone_number(output: str) -> str:
+    for raw in output.splitlines():
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        key = key.strip().lower()
+        if key not in {"telephone numbers", "telephone number", "phone number", "msisdn"}:
+            continue
+        for quoted in re.findall(r"'([^']+)'|\"([^\"]+)\"", value):
+            number = normalize_phone_number(quoted[0] or quoted[1])
+            if number:
+                return number
+        for token in value.replace(",", " ").split():
+            number = normalize_phone_number(token.strip("()[]"))
+            if number:
+                return number
+    return ""
+
+
+def infer_country_code_from_mcc(mcc: str = "") -> str:
+    digits = "".join(ch for ch in mcc if ch.isdigit())[:3]
+    return {
+        "234": "44",
+        "235": "44",
+        "460": "86",
+    }.get(digits, "")
+
+
+def parse_mbim_country_code(output: str) -> str:
+    subscriber_id = ""
+    iccid = ""
+    for raw in output.splitlines():
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip().strip("'\"")
+        if key == "subscriber id":
+            subscriber_id = value
+        elif key == "sim iccid":
+            iccid = value
+    digits = "".join(ch for ch in iccid if ch.isdigit())
+    if digits.startswith("8944"):
+        return "44"
+    if digits.startswith("8986"):
+        return "86"
+    return infer_country_code_from_mcc(subscriber_id)
+
+
+def infer_country_code_from_phone_number(phone_number: str = "") -> str:
+    if not phone_number.startswith("+"):
+        return ""
+    digits = "".join(ch for ch in phone_number[1:] if ch.isdigit())
+    for size in (3, 2, 1):
+        prefix = digits[:size]
+        if prefix in {"44", "86"}:
+            return prefix
+    return ""
+
+
+def format_phone_number_e164(phone_number: str = "", country_code: str = "") -> str:
+    if not phone_number:
+        return ""
+    code = "".join(ch for ch in country_code if ch.isdigit())
+    if phone_number.startswith("+"):
+        digits = "".join(ch for ch in phone_number[1:] if ch.isdigit())
+        code = code or infer_country_code_from_phone_number(phone_number)
+        local = digits[len(code) :] if code and digits.startswith(code) else digits
+    else:
+        local = "".join(ch for ch in phone_number if ch.isdigit())
+    if not code or not local:
+        return ""
+    if local.startswith("0"):
+        local = local[1:]
+    return f"+{code} - {local}" if local else ""
+
+
+def parse_mbim_number_info(output: str) -> tuple[str, str, str]:
+    phone_number = parse_mbim_phone_number(output)
+    country_code = infer_country_code_from_phone_number(phone_number) or parse_mbim_country_code(output)
+    return phone_number, country_code, format_phone_number_e164(phone_number, country_code)
+
+
+def infer_operator(network_code: str = "", imsi: str = "") -> str:
+    code = "".join(ch for ch in (network_code or imsi[:5]) if ch.isdigit())
+    if code.startswith("460"):
+        code = code[:5]
+    operators = {
+        "46000": "中国移动",
+        "46002": "中国移动",
+        "46004": "中国移动",
+        "46007": "中国移动",
+        "46008": "中国移动",
+        "46001": "中国联通",
+        "46006": "中国联通",
+        "46009": "中国联通",
+        "46010": "中国联通",
+        "46003": "中国电信",
+        "46005": "中国电信",
+        "46011": "中国电信",
+        "46012": "中国电信",
+        "23410": "O2 UK",
+        "23411": "O2 UK",
+        "23402": "O2 UK",
+        "23415": "Vodafone UK",
+        "23420": "Three UK",
+        "23430": "EE",
+        "23433": "EE",
+    }
+    return operators.get(code, "")
+
+
+def infer_operator_from_iccid(iccid: str = "") -> str:
+    digits = "".join(ch for ch in iccid if ch.isdigit())
+    if digits.startswith("898600") or digits.startswith("898602") or digits.startswith("898607"):
+        return "中国移动"
+    if digits.startswith("898601") or digits.startswith("898606") or digits.startswith("898609"):
+        return "中国联通"
+    if digits.startswith("898603") or digits.startswith("898611") or digits.startswith("898612"):
+        return "中国电信"
+    return ""
+
+
+def ucs2_hex(text: str) -> str:
+    return text.encode("utf-16-be").hex().upper()
+
+
+def first_match(pattern: str, text: str) -> str:
+    match = re.search(pattern, text, re.M)
+    return match.group(1).strip() if match else ""
+
+
+def format_sms_counts(sent: str = "", received: str = "", failed: str = "") -> str:
+    if not (sent or received or failed):
+        return ""
+    return f"已发 {sent or '0'} / 已收 {received or '0'} / 失败 {failed or '0'}"
+
+
+def describe_sim_state(imsi: str = "", has_status: bool = False) -> str:
+    if imsi:
+        return "已识别（IMSI 可用）"
+    if has_status:
+        return "未识别（无 IMSI）"
+    return "状态未知"
+
+
+def parse_smsd_monitor_output(output: str) -> dict:
+    values = {}
+    for raw in output.splitlines():
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        values[key.strip().lower()] = value.strip()
+
+    signal = values.get("networksignal", "")
+    if signal in {"-1", "99", "255"}:
+        signal = ""
+    imsi = values.get("imsi", "")
+    operator = values.get("netname", "") or infer_operator(values.get("netcode", ""), imsi) or values.get("netcode", "")
+    sim_state = describe_sim_state(imsi, bool(values))
+    return {
+        "sim_state": sim_state,
+        "sim_state_tone": "ok" if imsi else "bad",
+        "sim_identity": mask_sim_identity(imsi),
+        "phone_number": "",
+        "country_code": "",
+        "phone_number_e164": "",
+        "iccid": "",
+        "operator": operator,
+        "signal": signal,
+        "network_level": "",
+        "registration_state": "smsd 运行中" if values else "",
+        "network_state": "smsd 运行中" if values else "",
+        "sms_counts": format_sms_counts(values.get("sent", ""), values.get("received", ""), values.get("failed", "")),
+        "battery": f"{values.get('batterpercent', '')}%" if values.get("batterpercent", "") else "",
+        "error": "",
+    }
+
+
+def sim_problem_status(sim_state: str, network_state: str, error: str = "") -> dict:
+    return {
+        "sim_state": sim_state,
+        "sim_state_tone": "bad",
+        "sim_identity": "",
+        "phone_number": "",
+        "country_code": "",
+        "phone_number_e164": "",
+        "iccid": "",
+        "operator": "",
+        "signal": "",
+        "network_level": "",
+        "registration_state": network_state,
+        "network_state": network_state,
+        "sms_counts": "",
+        "battery": "",
+        "error": error,
+    }
+
+
+def parse_smsd_health_output(output: str) -> dict | None:
+    if "NOSIM" in output or "无法访问 SIM 卡" in output:
+        return sim_problem_status("未识别（无法访问 SIM 卡）", "smsd 无法访问 SIM 卡", "smsd 无法访问 SIM 卡")
+    if "DEVICEOPENERROR" in output or "Can't open device" in output or "Error opening device" in output:
+        return sim_problem_status("状态不可用（串口不可用）", "smsd 无法打开设备", "smsd 无法打开设备")
+    if "Error at init connection" in output or "UNKNOWN[27]" in output:
+        return sim_problem_status("状态不可用（串口通信失败）", "smsd 串口通信失败", "smsd 串口通信失败")
+    return None
+
+
+def read_smsd_health_status() -> dict | None:
+    try:
+        result = subprocess.run(
+            [
+                "journalctl",
+                "-u",
+                GAMMU_SMSD_SERVICE,
+                "--no-pager",
+                "--since",
+                f"{SMSD_HEALTH_LOG_MINUTES} minutes ago",
+                "-n",
+                "120",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_smsd_health_output((result.stdout + "\n" + result.stderr).strip())
+
+
+def read_smsd_service_state() -> str:
+    try:
+        result = subprocess.run(["systemctl", "is-active", GAMMU_SMSD_SERVICE], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return ""
+    output = (result.stdout + "\n" + result.stderr).strip()
+    state = output.splitlines()[0].strip() if output else ""
+    if result.returncode == 0 and state == "active":
+        return "active"
+    return state or f"exit {result.returncode}"
+
+
+def read_wwan_state() -> str:
+    try:
+        link = subprocess.run(["ip", "-brief", "link", "show", "wwan0"], capture_output=True, text=True, timeout=3)
+    except Exception:
+        return ""
+    return "DOWN" if " DOWN " in f" {link.stdout} " else ("UP" if " UP " in f" {link.stdout} " else "")
+
+
+def attach_wwan_status(status: dict) -> dict:
+    wwan_state = read_wwan_state()
+    phone_number = str(status.get("phone_number") or "")
+    country_code = str(status.get("country_code") or "")
+    phone_number_e164 = str(status.get("phone_number_e164") or "")
+    if not phone_number or not country_code or not phone_number_e164:
+        mbim_phone_number, mbim_country_code, mbim_phone_number_e164 = read_mbim_number_info()
+        phone_number = phone_number or mbim_phone_number
+        country_code = country_code or mbim_country_code
+        phone_number_e164 = phone_number_e164 or mbim_phone_number_e164
+    status.update(
+        {
+            "network_switch": "数据关闭",
+            "network_switch_tone": "ok" if wwan_state == "DOWN" else "warn",
+            "wwan_state": wwan_state,
+            "phone_number": phone_number or "",
+            "country_code": country_code or "",
+            "phone_number_e164": phone_number_e164 or "",
+            "checked_at": now_text(),
+        }
+    )
+    return status
+
+
+def read_at_sim_presence() -> str:
+    try:
+        with RadioLock(), ATSession() as at:
+            at.command("AT", timeout=1)
+            at.command("ATE0", timeout=1)
+            cpin = at.command("AT+CPIN?", timeout=2)
+            qsimstat = at.command("AT+QSIMSTAT?", timeout=2)
+    except Exception:
+        return ""
+    combined = f"{cpin}\n{qsimstat}"
+    if "+CPIN: READY" in combined and "+QSIMSTAT: 0,1" in combined:
+        return "ready"
+    if "+QSIMSTAT: 0,0" in combined or "+CME ERROR: 13" in combined or "+CME ERROR: 10" in combined:
+        return "missing"
+    return ""
+
+
+def read_mbim_sim_presence() -> str:
+    try:
+        result = subprocess.run(
+            ["mbimcli", "-p", "-d", MBIM_DEV, "--query-subscriber-ready-status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    output = (result.stdout + "\n" + result.stderr).lower()
+    if result.returncode != 0:
+        return ""
+    if "ready state: 'sim-not-inserted'" in output:
+        return "missing"
+    if "ready state: 'initialized'" in output:
+        return "ready"
+    return ""
+
+
+def read_mbim_phone_number() -> str:
+    phone_number, _country_code, _phone_number_e164 = read_mbim_number_info()
+    return phone_number
+
+
+def read_mbim_number_info() -> tuple[str, str, str]:
+    try:
+        result = subprocess.run(
+            ["mbimcli", "-p", "-d", MBIM_DEV, "--query-subscriber-ready-status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return "", "", ""
+    if result.returncode != 0:
+        return "", "", ""
+    return parse_mbim_number_info(result.stdout + "\n" + result.stderr)
+
+
+def read_sim_presence() -> str:
+    return read_mbim_sim_presence() or read_at_sim_presence()
+
+
+def estimate_segments(text: str) -> tuple[int, str]:
+    gsm7_chars = (
+        "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ"
+        "\u001bÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+        "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+    )
+    if all(ch in gsm7_chars for ch in text):
+        single, multi, encoding = 160, 153, "GSM-7"
+    else:
+        single, multi, encoding = 70, 67, "Unicode"
+    count = len(text)
+    if count <= single:
+        return 1, encoding
+    return (count + multi - 1) // multi, encoding
+
+
+def build_gammu_sms_command(destination: str, text: str) -> list[str]:
+    _segments, encoding = estimate_segments(text)
+    cmd = [
+        "/usr/bin/gammu-smsd-inject",
+        "-c",
+        GAMMU_SMSDRC,
+        "TEXT",
+        destination,
+    ]
+    if encoding == "Unicode":
+        cmd.append("-unicode")
+    cmd.extend(["-text", text])
+    return cmd
+
+
+def submitted_outbox_path(command_output: str) -> Path | None:
+    outbox = OUTBOX_PATH.resolve(strict=False)
+    for token in command_output.split():
+        text = token.strip().strip("\"'").rstrip(".,;")
+        if "/outbox/" not in text or not text.endswith(".smsbackup"):
+            continue
+        candidate = Path(text)
+        if not candidate.is_absolute():
+            continue
+        if candidate.parent.resolve(strict=False) == outbox:
+            return candidate
+    return None
+
+
+def wait_for_smsd_delivery(command_output: str) -> tuple[str, str]:
+    outbox_path = submitted_outbox_path(command_output)
+    if not outbox_path:
+        return "submitted", command_output[:1000]
+
+    sent_path = SENT_PATH / outbox_path.name
+    error_path = ERROR_PATH / outbox_path.name
+    deadline = time.monotonic() + SENT_WAIT_SECONDS
+    while True:
+        if sent_path.exists():
+            return "sent", command_output[:1000]
+        if error_path.exists():
+            message = f"{command_output}\nsmsd moved message to error queue: {error_path}"
+            return "failed", message[:1000]
+        if time.monotonic() >= deadline:
+            return "submitted", command_output[:1000]
+        time.sleep(0.5)
+
+
+def send_sms_gammu(destination: str, text: str) -> tuple[str, str]:
+    cmd = build_gammu_sms_command(destination, text)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SEND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return "ambiguous", f"gammu-smsd-inject timed out after {SEND_TIMEOUT_SECONDS}s; no automatic retry to avoid duplicate SMS"
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode == 0:
+        return wait_for_smsd_delivery(output)
+    return "failed", (output or f"gammu-smsd-inject exited with {result.returncode}")[:1000]
+
+
+def decode_ucs2_value(value: str) -> str:
+    text = (value or "").strip().strip('"')
+    compact = "".join(text.split())
+    if compact and len(compact) % 4 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", compact):
+        try:
+            decoded = bytes.fromhex(compact).decode("utf-16-be")
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+    return text
+
+
+def parse_cmgl_timestamp(value: str) -> str:
+    text = (value or "").strip().strip('"')
+    match = re.match(r"^(\d{2})/(\d{2})/(\d{2}),(\d{2}):(\d{2}):(\d{2})([+-]\d{2})?$", text)
+    if not match:
+        return now_text()
+    year, month, day, hour, minute, second, tz_quarters = match.groups()
+    tzinfo = dt.datetime.now().astimezone().tzinfo
+    if tz_quarters:
+        quarters = int(tz_quarters)
+        tzinfo = dt.timezone(dt.timedelta(minutes=15 * quarters))
+    return dt.datetime(
+        2000 + int(year),
+        int(month),
+        int(day),
+        int(hour),
+        int(minute),
+        int(second),
+        tzinfo=tzinfo,
+    ).astimezone().strftime(TIME_FORMAT)
+
+
+def parse_cmgl_messages(output: str) -> list[dict]:
+    messages = []
+    current = None
+    body_lines = []
+
+    def finish_current() -> None:
+        nonlocal current, body_lines
+        if not current:
+            return
+        body = "\n".join(line.strip() for line in body_lines if line.strip())
+        current["text"] = decode_ucs2_value(body)
+        messages.append(current)
+        current = None
+        body_lines = []
+
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("+CMGL:"):
+            finish_current()
+            header = line.split(":", 1)[1].strip()
+            fields = next(csv.reader([header]))
+            index = int(fields[0].strip())
+            sender = decode_ucs2_value(fields[2] if len(fields) > 2 else "")
+            received_at = parse_cmgl_timestamp(fields[4] if len(fields) > 4 else "")
+            current = {
+                "index": index,
+                "sender": sender,
+                "received_at": received_at,
+                "raw_ids": f"pve-cmgl-{index}",
+                "phone_id": "pve-radio-agent",
+                "sms_messages": 1,
+                "decoded_parts": 1,
+                "text": "",
+            }
+            continue
+        if line == "OK" or line == "ERROR":
+            finish_current()
+            continue
+        if current:
+            body_lines.append(line)
+    finish_current()
+    return messages
+
+
+class RadioLock:
+    def __enter__(self):
+        os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+        self._fh = open(LOCK_PATH, "w", encoding="utf-8")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+class ATSession:
+    def __enter__(self):
+        self.fd = os.open(AT_DEV, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        tty.setraw(self.fd, termios.TCSANOW)
+        attrs = termios.tcgetattr(self.fd)
+        attrs[4] = termios.B115200
+        attrs[5] = termios.B115200
+        attrs[2] |= termios.CLOCAL | termios.CREAD
+        attrs[2] &= ~termios.CRTSCTS
+        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        self._drain(0.2)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        os.close(self.fd)
+
+    def _read_available(self, timeout: float) -> bytes:
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return b""
+        try:
+            return os.read(self.fd, 4096)
+        except BlockingIOError:
+            return b""
+
+    def _drain(self, seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if not self._read_available(0.05):
+                break
+
+    def command(self, command: str, timeout: float = 5, prompt: bool = False) -> str:
+        os.write(self.fd, command.encode("ascii") + b"\r")
+        end = time.monotonic() + timeout
+        chunks = []
+        while time.monotonic() < end:
+            data = self._read_available(0.2)
+            if not data:
+                continue
+            chunks.append(data)
+            text = b"".join(chunks).decode("utf-8", errors="replace")
+            if prompt and ">" in text:
+                return text
+            if "\r\nOK\r\n" in text or "\nOK\r\n" in text or "ERROR" in text:
+                return text
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    def send_sms_ucs2(self, destination: str, text: str, timeout: float = 90) -> tuple[str, str]:
+        setup = [
+            "AT",
+            "ATE0",
+            "AT+CMGF=1",
+            'AT+CSCS="UCS2"',
+            "AT+CSMP=17,167,0,8",
+        ]
+        for command in setup:
+            output = self.command(command, timeout=5)
+            if "OK" not in output:
+                return "failed", f"{command} failed: {output.strip()[:500]}"
+        prompt = self.command(f'AT+CMGS="{ucs2_hex(destination)}"', timeout=10, prompt=True)
+        if ">" not in prompt:
+            return "failed", f"AT+CMGS prompt missing: {prompt.strip()[:500]}"
+        os.write(self.fd, ucs2_hex(text).encode("ascii") + b"\x1a")
+        end = time.monotonic() + timeout
+        chunks = []
+        while time.monotonic() < end:
+            data = self._read_available(0.5)
+            if not data:
+                continue
+            chunks.append(data)
+            output = b"".join(chunks).decode("utf-8", errors="replace")
+            if "+CMGS:" in output and "OK" in output:
+                return "submitted", output.strip()[:1000]
+            if "ERROR" in output:
+                return "failed", output.strip()[:1000]
+        return "ambiguous", "AT+CMGS timed out; no automatic retry to avoid duplicate SMS"
+
+
+def query_status() -> dict:
+    service_state = read_smsd_service_state()
+    if service_state and service_state != "active":
+        if read_sim_presence() == "missing":
+            status = sim_problem_status("未识别（无法访问 SIM 卡）", "smsd 无法访问 SIM 卡", "smsd 无法访问 SIM 卡")
+            return attach_wwan_status(status)
+        status = read_smsd_health_status() or sim_problem_status(
+            "状态不可用（smsd 未运行）",
+            f"smsd 未运行（{service_state}）",
+            f"{GAMMU_SMSD_SERVICE} is {service_state}",
+        )
+        return attach_wwan_status(status)
+
+    result = subprocess.run(
+        ["/usr/bin/gammu-smsd-monitor", "-c", GAMMU_SMSDRC, "-d", "0", "-n", "1"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode != 0 or not output:
+        raise RuntimeError(output or f"gammu-smsd-monitor exited with {result.returncode}")
+    status = parse_smsd_monitor_output(output)
+    if status.get("sim_identity") and read_sim_presence() == "missing":
+        replacement = sim_problem_status("未识别（无法访问 SIM 卡）", "smsd 无法访问 SIM 卡", "smsd 无法访问 SIM 卡")
+        if status.get("sms_counts"):
+            replacement["sms_counts"] = status["sms_counts"]
+        status = replacement
+    elif not status.get("sim_identity"):
+        if read_sim_presence() == "missing":
+            replacement = sim_problem_status("未识别（无法访问 SIM 卡）", "smsd 无法访问 SIM 卡", "smsd 无法访问 SIM 卡")
+            if status.get("sms_counts"):
+                replacement["sms_counts"] = status["sms_counts"]
+            status = replacement
+        else:
+            health_status = read_smsd_health_status()
+            if health_status:
+                if status.get("sms_counts"):
+                    health_status["sms_counts"] = status["sms_counts"]
+                status = health_status
+    return attach_wwan_status(status)
+
+
+def load_psycopg2():
+    try:
+        import psycopg2
+        import psycopg2.extras
+    except ImportError as exc:
+        raise RuntimeError("python3-psycopg2 is required") from exc
+    return psycopg2, psycopg2.extras
+
+
+def db_connect():
+    psycopg2, extras = load_psycopg2()
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=extras.RealDictCursor)
+    conn.autocommit = False
+    return conn
+
+
+def store_inbound_message(conn, message: dict) -> int | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM inbound_sms WHERE raw_ids = %s LIMIT 1", (message["raw_ids"],))
+        existing = cur.fetchone()
+        if existing:
+            return existing["id"]
+        cur.execute(
+            """
+            INSERT INTO inbound_sms
+              (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded, forward_error)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 0, '')
+            RETURNING id
+            """,
+            (
+                message["received_at"],
+                message["sender"],
+                message["text"],
+                message["raw_ids"],
+                message["phone_id"],
+                message["sms_messages"],
+                message["decoded_parts"],
+            ),
+        )
+        return cur.fetchone()["id"]
+
+
+def process_incoming_sms_once() -> None:
+    if not DATABASE_URL:
+        return
+    with RadioLock(), ATSession() as at:
+        for command in ("AT", "ATE0", "AT+CMGF=1", 'AT+CSCS="UCS2"'):
+            output = at.command(command, timeout=5)
+            if "OK" not in output:
+                raise RuntimeError(f"{command} failed while preparing inbound read: {output.strip()[:300]}")
+        messages = parse_cmgl_messages(at.command("AT+CMGL=0", timeout=15))
+        if not messages:
+            return
+        conn = db_connect()
+        try:
+            for message in messages:
+                record_id = store_inbound_message(conn, message)
+                conn.commit()
+                delete_output = at.command(f"AT+CMGD={message['index']}", timeout=8)
+                if "OK" not in delete_output:
+                    log(f"inbound_delete_failed index={message['index']} record_id={record_id} output={delete_output.strip()[:300]}")
+                else:
+                    log(f"inbound_stored record_id={record_id} raw_ids={message['raw_ids']} sender={message['sender']}")
+        finally:
+            conn.close()
+
+
+def claim_dispatch_job(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE sms_dispatch_jobs
+            SET status = 'leased',
+                lease_until = %s,
+                updated_at = %s
+            WHERE id = (
+              SELECT id
+              FROM sms_dispatch_jobs
+              WHERE status = 'queued'
+              ORDER BY id ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+            )
+            RETURNING *
+            """,
+            (
+                (dt.datetime.now().astimezone() + dt.timedelta(seconds=60)).strftime(TIME_FORMAT),
+                now_text(),
+            ),
+        )
+        return cur.fetchone()
+
+
+def mark_job(conn, job_id: int, status: str, message: str = "", result_status: str = "") -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE sms_dispatch_jobs
+            SET status = %s,
+                result_status = %s,
+                result_message = %s,
+                completed_at = CASE WHEN %s IN ('submitted','sent','failed','ambiguous','cancelled','skipped') THEN %s ELSE completed_at END,
+                updated_at = %s
+            WHERE id = %s
+            """,
+            (status, result_status or status, message[:2000], status, now_text(), now_text(), job_id),
+        )
+
+
+def process_dispatch_job(job) -> None:
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM outbound_sms WHERE id = %s FOR UPDATE", (job["outbound_id"],))
+            outbound = cur.fetchone()
+            if not outbound:
+                mark_job(conn, job["id"], "skipped", "outbound row not found", "skipped")
+                conn.commit()
+                return
+            if int(outbound.get("cancel_requested") or 0):
+                mark_job(conn, job["id"], "cancelled", "cancel_requested before send", "cancelled")
+                conn.commit()
+                return
+            if outbound["status"] != "dispatching":
+                mark_job(conn, job["id"], "skipped", f"outbound status is {outbound['status']}", "skipped")
+                conn.commit()
+                return
+            cur.execute(
+                "UPDATE sms_dispatch_jobs SET status = 'sending', checked_outbound_status = %s, checked_at = %s, updated_at = %s WHERE id = %s",
+                (outbound["status"], now_text(), now_text(), job["id"]),
+            )
+            conn.commit()
+
+        verify = db_connect()
+        try:
+            with verify.cursor() as cur:
+                cur.execute("SELECT status, cancel_requested FROM outbound_sms WHERE id = %s", (job["outbound_id"],))
+                latest = cur.fetchone()
+                if not latest or latest["status"] != "dispatching" or int(latest.get("cancel_requested") or 0):
+                    mark_job(verify, job["id"], "cancelled", "cancelled by final pre-send check", "cancelled")
+                    verify.commit()
+                    return
+        finally:
+            verify.close()
+
+        result_status, message = send_sms_gammu(job["destination"], job["text"])
+        done = db_connect()
+        try:
+            final_status = result_status if result_status in {"submitted", "sent", "failed", "ambiguous"} else "failed"
+            mark_job(done, job["id"], final_status, message, result_status)
+            done.commit()
+        finally:
+            done.close()
+    finally:
+        conn.close()
+
+
+def poll_loop() -> None:
+    if not DATABASE_URL:
+        log("dispatch polling disabled: SMS_DATABASE_URL/DATABASE_URL not set")
+        return
+    while True:
+        try:
+            conn = db_connect()
+            try:
+                job = claim_dispatch_job(conn)
+                conn.commit()
+            finally:
+                conn.close()
+            if job:
+                process_dispatch_job(job)
+                continue
+        except Exception as exc:
+            log(f"dispatch_error={exc}")
+        time.sleep(POLL_SECONDS)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "PVERadioAgent/1.0"
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] != "/sim/status":
+            self.send_error(404)
+            return
+        try:
+            payload = query_status()
+            status = 200
+        except Exception as exc:
+            payload = {
+                "sim_state": "状态不可用",
+                "sim_state_tone": "bad",
+                "network_switch": "数据关闭",
+                "network_switch_tone": "ok",
+                "phone_number": "",
+                "wwan_state": "",
+                "checked_at": now_text(),
+                "error": str(exc)[:300],
+            }
+            status = 503
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        log("%s %s" % (self.address_string(), fmt % args))
+
+
+def main() -> int:
+    threading.Thread(target=poll_loop, daemon=True).start()
+    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    log(f"listening on {BIND}:{PORT}, at_dev={AT_DEV}")
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

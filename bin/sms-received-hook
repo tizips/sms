@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 import datetime as _dt
+import fcntl
+import hashlib
+import json
 import os
+import re
+import socket
 import sqlite3
 import subprocess
 import sys
+import time
+import urllib.parse
 from email.message import EmailMessage
 from html import escape
 from pathlib import Path
@@ -16,6 +23,18 @@ DB = DATA / "sms.sqlite"
 LOG = LOGS / "sms-forward.log"
 MAIL_ENV = CONF / "sms-forward-mail.env"
 MSMTPRC = CONF / "msmtprc"
+INBOX = BASE / "spool" / "inbox"
+MULTIPART_DIR = DATA / "multipart-inbound"
+
+
+def env_seconds(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or str(default))
+    except ValueError:
+        return default
+
+
+MULTIPART_WAIT_SECONDS = env_seconds("SMS_MULTIPART_WAIT_SECONDS", 45)
 
 
 def env_int(name: str) -> int:
@@ -37,6 +56,275 @@ def sms_text() -> str:
     return "".join(parts)
 
 
+def decode_ucs2_hex(value: str) -> str:
+    compact = "".join((value or "").strip().strip('"').split())
+    if compact and len(compact) % 4 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", compact):
+        try:
+            decoded = bytes.fromhex(compact).decode("utf-16-be")
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+    return (value or "").strip().strip('"')
+
+
+def parse_concat_udh(udh: str) -> dict | None:
+    text = re.sub(r"[^0-9A-Fa-f]", "", udh or "").upper()
+    if len(text) >= 12 and text.startswith("050003"):
+        return {
+            "ref": text[6:8],
+            "total": int(text[8:10], 16),
+            "seq": int(text[10:12], 16),
+        }
+    if len(text) >= 14 and text.startswith("060804"):
+        return {
+            "ref": text[6:10],
+            "total": int(text[10:12], 16),
+            "seq": int(text[12:14], 16),
+        }
+    return None
+
+
+def parse_gammu_datetime_epoch(value: str) -> float | None:
+    text = (value or "").strip().strip('"')
+    try:
+        parsed = _dt.datetime.strptime(text[:15], "%Y%m%dT%H%M%S")
+    except Exception:
+        return None
+    return parsed.replace(tzinfo=_dt.datetime.now().astimezone().tzinfo).timestamp()
+
+
+def find_backup_file(raw_id: str) -> Path | None:
+    path = Path(raw_id)
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.append(INBOX / raw_id)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def parse_gammu_backup_parts(raw_id: str) -> list[dict]:
+    path = find_backup_file(raw_id)
+    if not path:
+        return []
+    sections = []
+    current = None
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if line.startswith("[SMSBackup"):
+            if current is not None:
+                sections.append(current)
+            current = {}
+            continue
+        if current is None or not line or line.startswith(";") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        current[key.strip()] = value.strip().strip("\r")
+    if current is not None:
+        sections.append(current)
+
+    parts = []
+    for section in sections:
+        concat = parse_concat_udh(section.get("UDH", ""))
+        if not concat:
+            continue
+        text_hex = "".join(value for key, value in sorted(section.items()) if key.startswith("Text"))
+        parts.append(
+            {
+                "raw_id": path.name,
+                "ref": concat["ref"],
+                "total": concat["total"],
+                "seq": concat["seq"],
+                "text": decode_ucs2_hex(text_hex),
+                "epoch": parse_gammu_datetime_epoch(section.get("DateTime", "")),
+            }
+        )
+    return parts
+
+
+def multipart_key(sender: str, ref: str, total: int) -> str:
+    digest = hashlib.sha1(f"{sender}|{ref}|{total}".encode("utf-8")).hexdigest()
+    return digest
+
+
+def multipart_state_path(key: str) -> Path:
+    return MULTIPART_DIR / f"{key}.json"
+
+
+class MultipartLock:
+    def __enter__(self):
+        MULTIPART_DIR.mkdir(parents=True, exist_ok=True)
+        self._fh = open(MULTIPART_DIR / ".lock", "w", encoding="utf-8")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+def load_multipart_state(key: str) -> dict | None:
+    path = multipart_state_path(key)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_multipart_state(state: dict) -> None:
+    path = multipart_state_path(state["key"])
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+
+
+def build_record_from_parts(
+    state: dict,
+    seqs: list[int],
+    received_at: str,
+    phone_id: str,
+    suffix: str = "",
+) -> dict:
+    parts = state.get("parts", {})
+    selected = [parts[str(seq)] for seq in sorted(seqs) if str(seq) in parts]
+    text = "".join(part.get("text", "") for part in selected)
+    if suffix:
+        text = f"{text}\n\n{suffix}"
+    return {
+        "received_at": received_at,
+        "sender": state.get("sender", ""),
+        "text": text,
+        "raw_ids": " ".join(part.get("raw_id", "") for part in selected if part.get("raw_id")),
+        "phone_id": phone_id,
+        "sms_messages": int(state.get("total") or len(selected)),
+        "decoded_parts": len(selected),
+    }
+
+
+def multipart_group_from_raw_ids(sender: str, raw_args: list[str], fallback_text: str) -> dict | None:
+    grouped = {}
+    now = time.time()
+    for raw_id in raw_args:
+        for part in parse_gammu_backup_parts(raw_id):
+            key = multipart_key(sender, part["ref"], part["total"])
+            grouped.setdefault(
+                key,
+                {
+                    "key": key,
+                    "sender": sender,
+                    "ref": part["ref"],
+                    "total": part["total"],
+                    "parts": {},
+                    "created_epoch": part.get("epoch") or now,
+                    "deadline_epoch": (part.get("epoch") or now) + MULTIPART_WAIT_SECONDS,
+                },
+            )
+            group = grouped[key]
+            group["created_epoch"] = min(group["created_epoch"], part.get("epoch") or now)
+            group["deadline_epoch"] = group["created_epoch"] + MULTIPART_WAIT_SECONDS
+            if not part.get("text") and len(raw_args) == 1:
+                part["text"] = fallback_text
+            group["parts"][str(part["seq"])] = part
+    return next(iter(grouped.values()), None)
+
+
+def spawn_multipart_flush(key: str, deadline_epoch: float) -> None:
+    cmd = [sys.executable or "/usr/bin/python3", str(Path(__file__).resolve()), "--flush-multipart", key]
+    with open(os.devnull, "rb") as stdin, open(os.devnull, "wb") as stdout, open(os.devnull, "wb") as stderr:
+        subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr, env=os.environ.copy(), start_new_session=True)
+
+
+def stage_multipart_group(group: dict, received_at: str, phone_id: str) -> tuple[dict | None, bool]:
+    spawn_flush = False
+    with MultipartLock():
+        state = load_multipart_state(group["key"])
+        if not state:
+            state = {
+                "key": group["key"],
+                "sender": group["sender"],
+                "ref": group["ref"],
+                "total": group["total"],
+                "created_epoch": group["created_epoch"],
+                "deadline_epoch": group["deadline_epoch"],
+                "parts": {},
+                "delivered": False,
+                "flushed_parts": [],
+                "flush_scheduled": False,
+            }
+        if state.get("delivered"):
+            return None, False
+
+        incoming_seqs = []
+        for seq, part in group["parts"].items():
+            state.setdefault("parts", {})[seq] = part
+            incoming_seqs.append(int(seq))
+        state["created_epoch"] = min(float(state.get("created_epoch") or group["created_epoch"]), group["created_epoch"])
+        state["deadline_epoch"] = state["created_epoch"] + MULTIPART_WAIT_SECONDS
+
+        total = int(state.get("total") or 0)
+        available = {int(seq) for seq in state.get("parts", {})}
+        expected = set(range(1, total + 1))
+        if total and expected.issubset(available) and not state.get("flushed_parts"):
+            state["delivered"] = True
+            save_multipart_state(state)
+            return build_record_from_parts(state, list(expected), received_at, phone_id), False
+
+        flushed = {int(seq) for seq in state.get("flushed_parts", [])}
+        if flushed:
+            late = [seq for seq in incoming_seqs if seq not in flushed]
+            if not late:
+                save_multipart_state(state)
+                return None, False
+            state["flushed_parts"] = sorted(flushed.union(late))
+            save_multipart_state(state)
+            suffix = f"[短信分片迟到：第 {','.join(str(seq) for seq in late)}/{total} 段]"
+            return build_record_from_parts(state, late, received_at, phone_id, suffix), False
+
+        if time.time() >= float(state.get("deadline_epoch") or 0):
+            seqs = sorted(available)
+            state["flushed_parts"] = seqs
+            save_multipart_state(state)
+            suffix = f"[短信分片未齐：已收到 {len(seqs)}/{total}，等待 {MULTIPART_WAIT_SECONDS} 秒后先转发]"
+            return build_record_from_parts(state, seqs, received_at, phone_id, suffix), False
+
+        if not state.get("flush_scheduled"):
+            state["flush_scheduled"] = True
+            spawn_flush = True
+        save_multipart_state(state)
+        return None, spawn_flush
+
+
+def prepare_inbound_record(
+    received_at: str,
+    sender: str,
+    text: str,
+    raw_args: list[str],
+    phone_id: str,
+    sms_messages: int,
+    decoded_parts: int,
+) -> dict | None:
+    raw_ids = " ".join(raw_args)
+    group = multipart_group_from_raw_ids(sender, raw_args, text)
+    if not group:
+        return {
+            "received_at": received_at,
+            "sender": sender,
+            "text": text,
+            "raw_ids": raw_ids,
+            "phone_id": phone_id,
+            "sms_messages": sms_messages,
+            "decoded_parts": decoded_parts,
+        }
+    record, should_spawn = stage_multipart_group(group, received_at, phone_id)
+    if should_spawn:
+        spawn_multipart_flush(group["key"], group["deadline_epoch"])
+    return record
+
+
 def load_env(path: Path) -> dict:
     values = {}
     if not path.exists():
@@ -52,9 +340,126 @@ def load_env(path: Path) -> dict:
     return values
 
 
+def database_url() -> str:
+    return os.environ.get("SMS_DATABASE_URL", "").strip() or os.environ.get("DATABASE_URL", "").strip()
+
+
+def using_postgres() -> bool:
+    return bool(database_url())
+
+
+def should_forward_in_hook() -> bool:
+    return os.environ.get("SMS_FORWARD_IN_HOOK", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def sms_redis_url() -> str:
+    return (
+        os.environ.get("SMS_REDIS_URL", "").strip()
+        or os.environ.get("REDIS_URL", "").strip()
+        or os.environ.get("VALKEY_URL", "").strip()
+    )
+
+
+def inbound_channel() -> str:
+    return os.environ.get("SMS_INBOUND_CHANNEL", "sms:inbound").strip() or "sms:inbound"
+
+
+def parse_redis_url(url: str) -> tuple[str, int, str, int]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"redis", "valkey"}:
+        raise ValueError("SMS_REDIS_URL must use redis:// or valkey://")
+    password = urllib.parse.unquote(parsed.password or "")
+    db_text = (parsed.path or "/0").lstrip("/") or "0"
+    return parsed.hostname or "127.0.0.1", parsed.port or 6379, password, int(db_text)
+
+
+def redis_command_bytes(*parts: str) -> bytes:
+    payload = [f"*{len(parts)}\r\n".encode("ascii")]
+    for part in parts:
+        data = str(part).encode("utf-8")
+        payload.append(f"${len(data)}\r\n".encode("ascii"))
+        payload.append(data + b"\r\n")
+    return b"".join(payload)
+
+
+def redis_read_value(reader):
+    line = reader.readline()
+    if not line:
+        raise ConnectionError("redis connection closed")
+    prefix = line[:1]
+    body = line[1:].rstrip(b"\r\n")
+    if prefix == b"+":
+        return body.decode("utf-8", errors="replace")
+    if prefix == b"-":
+        raise RuntimeError(body.decode("utf-8", errors="replace"))
+    if prefix == b":":
+        return int(body)
+    if prefix == b"$":
+        size = int(body)
+        if size < 0:
+            return None
+        data = reader.read(size)
+        reader.read(2)
+        return data.decode("utf-8", errors="replace")
+    if prefix == b"*":
+        return [redis_read_value(reader) for _ in range(int(body))]
+    raise RuntimeError(f"unknown redis response: {line!r}")
+
+
+def redis_publish(url: str, channel: str, payload: str) -> None:
+    host, port, password, database = parse_redis_url(url)
+    with socket.create_connection((host, port), timeout=3) as sock:
+        reader = sock.makefile("rb")
+        if password:
+            sock.sendall(redis_command_bytes("AUTH", password))
+            redis_read_value(reader)
+        if database:
+            sock.sendall(redis_command_bytes("SELECT", str(database)))
+            redis_read_value(reader)
+        sock.sendall(redis_command_bytes("PUBLISH", channel, payload))
+        redis_read_value(reader)
+
+
+def publish_inbound_notification(record_id: int) -> None:
+    url = sms_redis_url()
+    if not url:
+        return
+    redis_publish(url, inbound_channel(), json.dumps({"inbound_id": record_id}, separators=(",", ":")))
+
+
+def pg_connect():
+    try:
+        import psycopg2
+    except ImportError as exc:
+        raise RuntimeError("python3-psycopg2 is required when SMS_DATABASE_URL is set") from exc
+    return psycopg2.connect(database_url())
+
+
 def ensure_schema() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     LOGS.mkdir(parents=True, exist_ok=True)
+    if using_postgres():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS inbound_sms (
+                      id BIGSERIAL PRIMARY KEY,
+                      received_at TEXT NOT NULL,
+                      sender TEXT NOT NULL DEFAULT '',
+                      text TEXT NOT NULL DEFAULT '',
+                      raw_ids TEXT NOT NULL DEFAULT '',
+                      phone_id TEXT NOT NULL DEFAULT '',
+                      sms_messages INTEGER NOT NULL DEFAULT 0,
+                      decoded_parts INTEGER NOT NULL DEFAULT 0,
+                      forwarded INTEGER NOT NULL DEFAULT 0,
+                      forward_error TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_inbound_received_at ON inbound_sms(received_at)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_inbound_sms_sender ON inbound_sms(sender)")
+        return
     with sqlite3.connect(DB) as conn:
         conn.execute(
             """
@@ -77,6 +482,24 @@ def ensure_schema() -> None:
 
 
 def insert_sms(received_at: str, sender: str, text: str, raw_ids: str, phone_id: str, sms_messages: int, decoded_parts: int) -> int:
+    if using_postgres():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                if raw_ids:
+                    cur.execute("SELECT id FROM inbound_sms WHERE raw_ids = %s LIMIT 1", (raw_ids,))
+                    existing = cur.fetchone()
+                    if existing:
+                        return int(existing[0])
+                cur.execute(
+                    """
+                    INSERT INTO inbound_sms
+                      (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts, forwarded, forward_error)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 0, '')
+                    RETURNING id
+                    """,
+                    (received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts),
+                )
+                return int(cur.fetchone()[0])
     with sqlite3.connect(DB) as conn:
         cur = conn.execute(
             """
@@ -90,6 +513,14 @@ def insert_sms(received_at: str, sender: str, text: str, raw_ids: str, phone_id:
 
 
 def update_forward_status(record_id: int, forwarded: int, forward_error: str) -> None:
+    if using_postgres():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE inbound_sms SET forwarded = %s, forward_error = %s WHERE id = %s",
+                    (forwarded, forward_error[:1000], record_id),
+                )
+        return
     with sqlite3.connect(DB) as conn:
         conn.execute(
             "UPDATE inbound_sms SET forwarded = ?, forward_error = ? WHERE id = ?",
@@ -193,24 +624,96 @@ def send_mail(record_id: int, sender: str, text: str, received_at: str, raw_ids:
         return 0, str(exc)
 
 
+def deliver_inbound_record(record: dict) -> int:
+    record_id = insert_sms(
+        record["received_at"],
+        record["sender"],
+        record["text"],
+        record["raw_ids"],
+        record["phone_id"],
+        record["sms_messages"],
+        record["decoded_parts"],
+    )
+    if should_forward_in_hook():
+        forwarded, forward_error = send_mail(
+            record_id,
+            record["sender"],
+            record["text"],
+            record["received_at"],
+            record["raw_ids"],
+            record["phone_id"],
+        )
+    else:
+        forwarded, forward_error = 0, ""
+    update_forward_status(record_id, forwarded, forward_error)
+    redis_error = ""
+    try:
+        publish_inbound_notification(record_id)
+    except Exception as exc:
+        redis_error = str(exc)
+
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"{record['received_at']} id={record_id} from={record['sender']} "
+            f"ids={record['raw_ids']} forwarded={forwarded} text={record['text']}\n"
+        )
+        if forward_error:
+            fh.write(f"{record['received_at']} id={record_id} forward_error={forward_error}\n")
+        if redis_error:
+            fh.write(f"{record['received_at']} id={record_id} redis_error={redis_error}\n")
+    return record_id
+
+
+def flush_multipart_key(key: str) -> int:
+    state = load_multipart_state(key)
+    if not state:
+        return 0
+    delay = max(0, float(state.get("deadline_epoch") or 0) - time.time())
+    if delay:
+        time.sleep(delay)
+    with MultipartLock():
+        state = load_multipart_state(key)
+        if not state or state.get("delivered") or state.get("flushed_parts"):
+            return 0
+        parts = {int(seq) for seq in state.get("parts", {})}
+        if not parts:
+            return 0
+        state["flushed_parts"] = sorted(parts)
+        save_multipart_state(state)
+        suffix = (
+            f"[短信分片未齐：已收到 {len(parts)}/{int(state.get('total') or len(parts))}，"
+            f"等待 {MULTIPART_WAIT_SECONDS} 秒后先转发]"
+        )
+        record = build_record_from_parts(
+            state,
+            sorted(parts),
+            _dt.datetime.now().astimezone().strftime("%F %T %z"),
+            os.environ.get("PHONE_ID", ""),
+            suffix,
+        )
+    return deliver_inbound_record(record)
+
+
 def main() -> int:
     ensure_schema()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--flush-multipart":
+        flush_multipart_key(sys.argv[2])
+        return 0
+
     received_at = _dt.datetime.now().astimezone().strftime("%F %T %z")
     sender = os.environ.get("SMS_1_NUMBER", "unknown")
     text = sms_text()
-    raw_ids = " ".join(sys.argv[1:])
+    raw_args = sys.argv[1:]
     phone_id = os.environ.get("PHONE_ID", "")
     sms_messages = env_int("SMS_MESSAGES")
     decoded_parts = env_int("DECODED_PARTS")
 
-    record_id = insert_sms(received_at, sender, text, raw_ids, phone_id, sms_messages, decoded_parts)
-    forwarded, forward_error = send_mail(record_id, sender, text, received_at, raw_ids, phone_id)
-    update_forward_status(record_id, forwarded, forward_error)
-
-    with LOG.open("a", encoding="utf-8") as fh:
-        fh.write(f"{received_at} id={record_id} from={sender} ids={raw_ids} forwarded={forwarded} text={text}\n")
-        if forward_error:
-            fh.write(f"{received_at} id={record_id} forward_error={forward_error}\n")
+    record = prepare_inbound_record(received_at, sender, text, raw_args, phone_id, sms_messages, decoded_parts)
+    if record is None:
+        with LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{received_at} from={sender} ids={' '.join(raw_args)} multipart_deferred=1\n")
+        return 0
+    deliver_inbound_record(record)
     return 0
 
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run PVE SIM watchdog every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=pve-sim-watchdog.service
+
+[Install]
+WantedBy=timers.target
