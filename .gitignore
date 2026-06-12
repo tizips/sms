@@ -5,6 +5,7 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+AGENTS.md
 
 # Python
 __pycache__/
@@ -27,6 +28,7 @@ dist/
 .env.*
 *.env
 *.local
+!admin/admin.env.example
 
 # Logs and local databases
 *.log
@@ -56,6 +58,5 @@ data/*
 !data/sms.sqlite
 !data/gammu-smsd.sqlite
 
-# Local configuration; keep example files tracked.
-conf/*
-!conf/*example
+# Local configuration; keep runtime config out of git.
+conf/
