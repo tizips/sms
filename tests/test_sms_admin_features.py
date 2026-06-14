@@ -454,6 +454,191 @@ def test_pve_agent_status_builds_e164_for_uk_local_mbim_number():
     assert_true(status["operator"] == "O2 UK", "PVE status infers UK O2 operator from IMSI")
 
 
+def test_pve_agent_reuses_static_identity_without_rereading_mbim_number():
+    agent = load_pve_agent()
+    mbim_number_reads = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 234102356147404\nNetworkSignal: 100\nSent: 1\nReceived: 2\nFailed: 0\n")
+        return RunResult()
+
+    def fake_read_mbim_number_info():
+        mbim_number_reads.append(1)
+        if len(mbim_number_reads) > 1:
+            raise AssertionError("MBIM number info should be cached after first successful read")
+        return "07922675277", "44", "+44 - 7922675277"
+
+    old_run = agent.subprocess.run
+    old_read_number = agent.read_mbim_number_info
+    old_presence = agent.read_sim_presence
+    old_wwan = agent.read_wwan_state
+    old_signal = agent.read_at_signal_dbm
+    old_cache = getattr(agent, "STATIC_SIM_CACHE", {}).copy()
+    try:
+        agent.STATIC_SIM_CACHE.clear()
+        agent.subprocess.run = fake_run
+        agent.read_mbim_number_info = fake_read_mbim_number_info
+        agent.read_sim_presence = lambda: "ready"
+        agent.read_wwan_state = lambda: "DOWN"
+        agent.read_at_signal_dbm = lambda: -51
+        first = agent.query_status()
+        second = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+        agent.read_mbim_number_info = old_read_number
+        agent.read_sim_presence = old_presence
+        agent.read_wwan_state = old_wwan
+        agent.read_at_signal_dbm = old_signal
+        agent.STATIC_SIM_CACHE.clear()
+        agent.STATIC_SIM_CACHE.update(old_cache)
+
+    assert_true(len(mbim_number_reads) == 1, "PVE agent reads MBIM number info only once")
+    assert_true(first["phone_number_e164"] == "+44 - 7922675277", "first status stores formatted phone number")
+    assert_true(second["phone_number_e164"] == "+44 - 7922675277", "second status reuses cached formatted phone number")
+    assert_true(second["operator"] == "O2 UK", "operator remains available from static identity")
+
+
+def test_pve_agent_status_converts_monitor_signal_to_dbm_without_at_query():
+    agent = load_pve_agent()
+    commands = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class FakeLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeAT:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def command(self, command, **kwargs):
+            commands.append(command)
+            raise AssertionError("monitor signal should avoid slow AT signal query")
+            responses = {
+                "AT": "OK",
+                "ATE0": "OK",
+                "AT+CSQ": "+CSQ: 23,99\n\nOK",
+                'AT+QENG="servingcell"': '+QENG: "servingcell","SEARCH"\n\nOK',
+            }
+            return responses.get(command, "OK")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 234102356147404\nNetworkSignal: 100\nSent: 0\nReceived: 5\nFailed: 0\n")
+        if cmd and cmd[0] == "mbimcli":
+            return RunResult(
+                stdout="""
+[/dev/wwan0mbim0] Subscriber ready status retrieved:
+             Ready state: 'initialized'
+            Subscriber ID: '234102356147404'
+                SIM ICCID: '8944110069285243963F'
+       Telephone numbers: (1) '07922675277'
+"""
+            )
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    old_lock = agent.RadioLock
+    old_at = agent.ATSession
+    try:
+        agent.subprocess.run = fake_run
+        agent.RadioLock = FakeLock
+        agent.ATSession = FakeAT
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+        agent.RadioLock = old_lock
+        agent.ATSession = old_at
+
+    assert_true("AT+CSQ" not in commands, "PVE agent avoids slow AT signal quality when monitor signal is available")
+    assert_true(status["signal"] == "-51 dBm", "PVE status converts monitor percentage to dBm")
+    assert_true(status["signal_dbm"] == -51, "PVE status exposes numeric monitor-derived dBm")
+
+
+def test_pve_agent_status_does_not_convert_unknown_signal_to_dbm():
+    agent = load_pve_agent()
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class FakeLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeAT:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def command(self, command, **kwargs):
+            responses = {
+                "AT": "OK",
+                "ATE0": "OK",
+                "AT+CSQ": "+CSQ: 99,99\n\nOK",
+                'AT+QENG="servingcell"': '+QENG: "servingcell","SEARCH"\n\nOK',
+            }
+            return responses.get(command, "OK")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "is-active", "gammu-smsd.service"]:
+            return RunResult(stdout="active\n")
+        if cmd and "gammu-smsd-monitor" in cmd[0]:
+            return RunResult(stdout="IMSI: 234102356147404\nNetworkSignal: 0\nSent: 0\nReceived: 5\nFailed: 0\n")
+        if cmd and cmd[0] == "mbimcli":
+            return RunResult(stdout="Ready state: 'initialized'\nSubscriber ID: '234102356147404'\n")
+        if cmd[:4] == ["ip", "-brief", "link", "show"]:
+            return RunResult(stdout="wwan0            DOWN\n")
+        return RunResult()
+
+    old_run = agent.subprocess.run
+    old_lock = agent.RadioLock
+    old_at = agent.ATSession
+    try:
+        agent.subprocess.run = fake_run
+        agent.RadioLock = FakeLock
+        agent.ATSession = FakeAT
+        status = agent.query_status()
+    finally:
+        agent.subprocess.run = old_run
+        agent.RadioLock = old_lock
+        agent.ATSession = old_at
+
+    assert_true(status["signal"] == "", "unknown monitor and AT signal is hidden instead of shown as 0 dBm")
+    assert_true(status["signal_dbm"] == "", "unknown signal has no numeric dBm")
+
+
 def test_pve_agent_status_checks_at_presence_when_smsd_is_inactive():
     agent = load_pve_agent()
     commands = []
@@ -567,6 +752,60 @@ def test_pve_watchdog_prefers_mbim_presence_over_stale_monitor_imsi():
     assert_true(any(cmd and cmd[0] == "mbimcli" for cmd in calls), "watchdog checks MBIM subscriber readiness")
     assert_true(not ready, "MBIM no-SIM overrides stale monitor IMSI")
     assert_true("sim-not-inserted" in details, "watchdog details include MBIM no-SIM state")
+
+
+def test_pve_watchdog_recovery_reenables_mbim_software_radio():
+    watchdog = load_pve_watchdog()
+    calls = []
+
+    class RunResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    class FakeLock:
+        def __enter__(self):
+            calls.append(["lock"])
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            calls.append(["unlock"])
+            return False
+
+    old_run = watchdog.subprocess.run
+    old_at = watchdog.at_command
+    old_sleep = watchdog.time.sleep
+    old_lock = watchdog.RadioLock
+    old_ready = watchdog.sim_is_ready
+    old_force = watchdog.force_wwan_down
+    old_log = watchdog.log
+    try:
+        watchdog.subprocess.run = lambda cmd, **kwargs: calls.append(cmd) or RunResult(stdout="ok")
+        watchdog.at_command = lambda command, timeout=8: calls.append(["at", command, timeout]) or "OK"
+        watchdog.time.sleep = lambda seconds: calls.append(["sleep", seconds])
+        watchdog.RadioLock = FakeLock
+        watchdog.sim_is_ready = lambda: (True, "mbim_ready_state=initialized")
+        watchdog.force_wwan_down = lambda: calls.append(["force_wwan_down"])
+        watchdog.log = lambda message: calls.append(["log", message])
+        watchdog.recover_sim()
+    finally:
+        watchdog.subprocess.run = old_run
+        watchdog.at_command = old_at
+        watchdog.time.sleep = old_sleep
+        watchdog.RadioLock = old_lock
+        watchdog.sim_is_ready = old_ready
+        watchdog.force_wwan_down = old_force
+        watchdog.log = old_log
+
+    assert_true(
+        ["mbimcli", "-p", "-d", watchdog.MBIM_DEV, "--set-radio-state=on"] in calls,
+        "watchdog recovery explicitly re-enables MBIM software radio",
+    )
+    assert_true(
+        any(call[:3] == ["systemctl", "restart", "quectel-radio-unlock.service"] for call in calls),
+        "watchdog reruns the FCC/radio unlock service during recovery",
+    )
 
 
 def test_pve_watchdog_main_does_not_force_wwan_down_when_sim_ready():
@@ -1041,6 +1280,60 @@ def test_dashboard_sim_status_places_phone_signal_unit_and_data_switch():
         cleanup(base)
 
 
+def test_dashboard_sim_status_renders_dbm_signal_quality_pill():
+    admin, base = load_admin()
+    try:
+        admin.init_db()
+
+        class Dummy:
+            table_inbound = admin.AdminHandler.table_inbound
+            table_outbound = admin.AdminHandler.table_outbound
+
+        old_get_sim_status = admin.get_sim_status
+        try:
+            admin.get_sim_status = lambda: {
+                "sim_state": "已识别（IMSI 可用）",
+                "sim_identity": "23410******7404",
+                "phone_number": "+44 - 7922675277",
+                "sms_counts": "已发 0 / 已收 3 / 失败 0",
+                "signal": "-60 dBm",
+                "signal_dbm": -60,
+                "network_switch": "数据关闭",
+                "network_switch_tone": "ok",
+                "operator": "O2 UK",
+                "checked_at": "2026-06-12 18:40:00 +0800",
+                "error": "",
+            }
+            body = admin.AdminHandler.render_dashboard(Dummy()).decode("utf-8")
+        finally:
+            admin.get_sim_status = old_get_sim_status
+
+        signal_row = body[body.index("<tr><th>信号强度</th>") : body.index("</tr>", body.index("<tr><th>信号强度</th>"))]
+        assert_true("-60 dBm" in signal_row, "dBm signal is shown as the main signal value")
+        assert_true('class="status-pill ok"' in signal_row, "strong dBm signal uses a green quality capsule")
+        assert_true(">极强/强<" in signal_row, "strong dBm signal labels the quality")
+        assert_true("renderSignal(status);" in body, "SSE updates signal with the rich renderer")
+        assert_true('setField("signal", formatSignal(status.signal));' not in body, "SSE no longer overwrites signal pill as text")
+        assert_true('"ok"' in body and "极强/强" in body, "SSE script knows the green signal quality")
+    finally:
+        cleanup(base)
+
+
+def test_signal_quality_uses_mobile_dbm_strength_table():
+    admin, base = load_admin()
+    try:
+        assert_true(admin.signal_quality_for_dbm(-50) == ("极强/强", "ok"), "-50 dBm is strong")
+        assert_true(admin.signal_quality_for_dbm(-79) == ("极强/强", "ok"), "-79 dBm is still strong")
+        assert_true(admin.signal_quality_for_dbm(-80) == ("良好", "good"), "-80 dBm is good")
+        assert_true(admin.signal_quality_for_dbm(-89) == ("良好", "good"), "-89 dBm is still good")
+        assert_true(admin.signal_quality_for_dbm(-90) == ("一般", "warn"), "-90 dBm is normal")
+        assert_true(admin.signal_quality_for_dbm(-99) == ("一般", "warn"), "-99 dBm is still normal")
+        assert_true(admin.signal_quality_for_dbm(-100) == ("较弱", "bad"), "-100 dBm is weak")
+        assert_true(admin.signal_quality_for_dbm(None) == ("", ""), "missing dBm has no quality")
+    finally:
+        cleanup(base)
+
+
 def test_dashboard_sim_error_uses_bad_pill_without_error_detail():
     admin, base = load_admin()
     try:
@@ -1376,7 +1669,8 @@ NetworkSignal: 100
 """
         info = admin.parse_smsd_monitor_output(output)
         assert_true(info["sim_state"] == "已识别（IMSI 可用）", "monitor IMSI marks SIM as identified")
-        assert_true(info["signal"] == "100", "monitor signal is parsed without percent sign")
+        assert_true(info["signal"] == "-51 dBm", "monitor signal is converted to dBm")
+        assert_true(info["signal_dbm"] == -51, "monitor signal exposes numeric dBm")
         assert_true(info["network_level"] == "100%", "monitor network level follows signal")
         assert_true(info["network_state"] == "smsd 运行中", "monitor status reports smsd source")
         assert_true(info["network_switch"] == "数据关闭", "monitor signal does not imply data switch is on")
@@ -1512,7 +1806,9 @@ def test_get_sim_status_can_bypass_cache_and_use_smsd_monitor():
         assert_true(calls and "gammu-smsd-monitor" in calls[0][0], "SIM status uses smsd monitor first")
         assert_true(status["sim_state"] == "已识别（IMSI 可用）", "uncached monitor status identifies SIM")
         assert_true(status["sim_identity"] == "46011******4699", "uncached monitor status masks IMSI")
-        assert_true(status["signal"] == "100", "uncached monitor status signal omits percent sign")
+        assert_true(status["signal"] == "-51 dBm", "uncached monitor status converts signal to dBm")
+        assert_true(status["signal_dbm"] == -51, "uncached monitor status exposes numeric dBm")
+        assert_true(status["network_level"] == "100%", "uncached monitor status keeps percentage level")
         assert_true(status["network_switch"] == "数据关闭", "uncached monitor status keeps data switch closed")
     finally:
         cleanup(base)
@@ -1617,9 +1913,79 @@ def test_get_sim_status_uses_pve_agent_when_configured():
         finally:
             admin.urllib.request.urlopen = old_urlopen
 
-        assert_true(calls == [("http://pve-agent.local:8091/sim/status", 3)], "SIM status calls PVE agent endpoint")
+        assert_true(
+            calls == [("http://pve-agent.local:8091/sim/status", admin.PVE_AGENT_TIMEOUT_SECONDS)],
+            "SIM status calls PVE agent endpoint with the configured timeout",
+        )
         assert_true(status["operator"] == "中国电信", "PVE agent operator is returned")
         assert_true(status["network_switch"] == "数据关闭", "PVE agent keeps data switch closed")
+    finally:
+        if old_url is None:
+            os.environ.pop("PVE_RADIO_AGENT_URL", None)
+        else:
+            os.environ["PVE_RADIO_AGENT_URL"] = old_url
+        cleanup(base)
+
+
+def test_pve_agent_timeout_keeps_cached_static_identity_only():
+    old_url = os.environ.get("PVE_RADIO_AGENT_URL")
+    os.environ["PVE_RADIO_AGENT_URL"] = "http://pve-agent.local:8091"
+    admin, base = load_admin()
+    try:
+        calls = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "sim_state": "已识别（IMSI 可用）",
+                        "sim_identity": "23410******7404",
+                        "phone_number": "07922675277",
+                        "country_code": "44",
+                        "phone_number_e164": "+44 - 7922675277",
+                        "operator": "O2 UK",
+                        "sms_counts": "已发 1 / 已收 2 / 失败 0",
+                        "signal": "-51 dBm",
+                        "signal_dbm": -51,
+                        "network_switch": "数据关闭",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout=0):
+            calls.append((request.full_url, timeout))
+            if len(calls) == 1:
+                return Response()
+            raise TimeoutError("timed out")
+
+        old_urlopen = admin.urllib.request.urlopen
+        old_cache = getattr(admin, "PVE_STATIC_STATUS_CACHE", {}).copy()
+        try:
+            if hasattr(admin, "PVE_STATIC_STATUS_CACHE"):
+                admin.PVE_STATIC_STATUS_CACHE.clear()
+            admin.urllib.request.urlopen = fake_urlopen
+            first = admin.get_sim_status(use_cache=False)
+            second = admin.get_sim_status(use_cache=False)
+        finally:
+            admin.urllib.request.urlopen = old_urlopen
+            if hasattr(admin, "PVE_STATIC_STATUS_CACHE"):
+                admin.PVE_STATIC_STATUS_CACHE.clear()
+                admin.PVE_STATIC_STATUS_CACHE.update(old_cache)
+
+        assert_true(first["operator"] == "O2 UK", "first successful PVE status returns operator")
+        assert_true(second["error"] == "timed out", "timeout is still visible as a dynamic read failure")
+        assert_true(second["sim_identity"] == "23410******7404", "timeout keeps cached SIM identity")
+        assert_true(second["phone_number"] == "07922675277", "timeout keeps cached raw phone number")
+        assert_true(second["phone_number_e164"] == "+44 - 7922675277", "timeout keeps cached formatted phone number")
+        assert_true(second["operator"] == "O2 UK", "timeout keeps cached operator")
+        assert_true(second["sms_counts"] == "", "timeout does not reuse dynamic SMS counters")
+        assert_true(second["signal"] == "", "timeout does not reuse dynamic signal")
     finally:
         if old_url is None:
             os.environ.pop("PVE_RADIO_AGENT_URL", None)
@@ -1637,6 +2003,55 @@ def test_sse_event_formats_json_payload():
         payload = json.loads(data_line.removeprefix("data: "))
         assert_true(payload["sim_state"] == "已识别", "SSE payload is JSON")
         assert_true(event.endswith("\n\n"), "SSE event is terminated by a blank line")
+    finally:
+        cleanup(base)
+
+
+def test_sim_status_stream_refreshes_every_second():
+    admin, base = load_admin()
+    try:
+        assert_true(admin.SIM_STATUS_STREAM_INTERVAL_SECONDS == 1, "SIM status stream default interval is one second")
+        sleeps = []
+        events = []
+
+        class FakeWFile:
+            def write(self, payload):
+                events.append(payload.decode("utf-8"))
+
+            def flush(self):
+                pass
+
+        class Dummy:
+            wfile = FakeWFile()
+
+            def send_response(self, status):
+                pass
+
+            def send_header(self, key, value):
+                pass
+
+            def end_headers(self):
+                pass
+
+        old_seconds = admin.SIM_STATUS_STREAM_SECONDS
+        old_interval = admin.SIM_STATUS_STREAM_INTERVAL_SECONDS
+        old_sleep = admin.time.sleep
+        old_get_status = admin.get_sim_status
+        try:
+            admin.SIM_STATUS_STREAM_SECONDS = 3
+            admin.SIM_STATUS_STREAM_INTERVAL_SECONDS = 1
+            admin.time.sleep = lambda seconds: sleeps.append(seconds)
+            admin.get_sim_status = lambda use_cache=False: {"sim_state": "已识别", "signal": "-51 dBm"}
+            admin.AdminHandler.stream_sim_status(Dummy())
+        finally:
+            admin.SIM_STATUS_STREAM_SECONDS = old_seconds
+            admin.SIM_STATUS_STREAM_INTERVAL_SECONDS = old_interval
+            admin.time.sleep = old_sleep
+            admin.get_sim_status = old_get_status
+
+        assert_true(sleeps == [1, 1], "SIM status stream sleeps one second between events")
+        assert_true(sum("event: sim-status" in event for event in events) == 3, "stream emits the configured number of status events")
+        assert_true(any("event: done" in event for event in events), "stream emits done after status events")
     finally:
         cleanup(base)
 
@@ -2999,9 +3414,13 @@ def main():
         test_pve_agent_status_checks_mbim_presence_over_empty_monitor_identity,
         test_pve_agent_status_reads_phone_number_from_mbim,
         test_pve_agent_status_builds_e164_for_uk_local_mbim_number,
+        test_pve_agent_reuses_static_identity_without_rereading_mbim_number,
+        test_pve_agent_status_converts_monitor_signal_to_dbm_without_at_query,
+        test_pve_agent_status_does_not_convert_unknown_signal_to_dbm,
         test_pve_agent_status_checks_at_presence_when_smsd_is_inactive,
         test_pve_watchdog_treats_empty_monitor_imsi_as_not_ready,
         test_pve_watchdog_prefers_mbim_presence_over_stale_monitor_imsi,
+        test_pve_watchdog_recovery_reenables_mbim_software_radio,
         test_pve_watchdog_main_does_not_force_wwan_down_when_sim_ready,
         test_sms_received_hook_can_disable_local_mail_forwarding,
         test_sms_received_hook_publishes_inbound_notification_when_configured,
@@ -3017,6 +3436,8 @@ def main():
         test_delete_default_strategy_is_blocked,
         test_dashboard_omits_cost_protection_notice,
         test_dashboard_sim_status_places_phone_signal_unit_and_data_switch,
+        test_dashboard_sim_status_renders_dbm_signal_quality_pill,
+        test_signal_quality_uses_mobile_dbm_strength_table,
         test_dashboard_sim_error_uses_bad_pill_without_error_detail,
         test_dashboard_uses_pve_service_label_in_pve_dispatch_mode,
         test_login_page_uses_border_box_sizing,
@@ -3036,7 +3457,9 @@ def main():
         test_get_sim_status_can_bypass_cache_and_use_smsd_monitor,
         test_get_sim_status_ignores_smsd_database_for_realtime_status,
         test_get_sim_status_uses_pve_agent_when_configured,
+        test_pve_agent_timeout_keeps_cached_static_identity_only,
         test_sse_event_formats_json_payload,
+        test_sim_status_stream_refreshes_every_second,
         test_sim_status_stream_payload_prefers_e164_phone_number,
         test_sms_command_uses_unicode_for_chinese_text,
         test_sms_command_keeps_gsm7_without_unicode_flag,

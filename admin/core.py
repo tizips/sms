@@ -6,6 +6,7 @@ import hmac
 import html
 import json
 import os
+import re
 import select
 import secrets
 import socket
@@ -86,6 +87,7 @@ ADMIN_MINUTE_DISPLAY_FORMAT = "%Y/%m/%d %H:%M"
 SEND_INTERVAL_MAX_MINUTES = 180 * 24 * 60
 RETRY_INTERVAL_MAX_MINUTES = 10080
 SIM_STATUS_STREAM_SECONDS = 60
+SIM_STATUS_STREAM_INTERVAL_SECONDS = 1
 SMSD_HEALTH_LOG_MINUTES = 10
 SUBMITTED_SEND_TIMEOUT_MINUTES = 10
 SPOOL = BASE / "spool"
@@ -134,6 +136,54 @@ def format_signal_strength(value) -> str:
     if number.isdigit():
         return f"{text}%"
     return text
+
+
+def monitor_signal_percent_to_dbm(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value or "").strip().rstrip("%")
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return None
+    percent = int(round(float(text)))
+    if percent <= 0 or percent > 100 or percent == 255:
+        return None
+    rssi = int((percent * 31 + 50) // 100)
+    return -113 + (2 * rssi)
+
+
+def parse_signal_dbm(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        dbm = int(round(value))
+        return dbm if -140 <= dbm <= -20 else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"(-?\d+(?:\.\d+)?)\s*dBm\b", text, re.I)
+    if not match:
+        return None
+    dbm = int(round(float(match.group(1))))
+    return dbm if -140 <= dbm <= -20 else None
+
+
+def signal_dbm_from_status(status: dict) -> int | None:
+    dbm = parse_signal_dbm(status.get("signal_dbm"))
+    if dbm is not None:
+        return dbm
+    return parse_signal_dbm(status.get("signal"))
+
+
+def signal_quality_for_dbm(dbm: int | None) -> tuple[str, str]:
+    if dbm is None:
+        return "", ""
+    if dbm >= -79:
+        return "极强/强", "ok"
+    if dbm >= -89:
+        return "良好", "good"
+    if dbm >= -99:
+        return "一般", "warn"
+    return "较弱", "bad"
 
 
 def parse_env(path: Path) -> dict:

@@ -31,8 +31,27 @@ def sim_status_script() -> str:
         if (/^-?\\d+$/.test(text)) return text + "%";
         return text;
       }
+      function signalDbm(status) {
+        var explicit = status.signal_dbm;
+        if (explicit !== undefined && explicit !== null && String(explicit).trim() !== "") {
+          var parsed = Number(explicit);
+          if (Number.isFinite(parsed) && parsed >= -140 && parsed <= -20) return Math.round(parsed);
+        }
+        var match = String(status.signal || "").match(/(-?\\d+(?:\\.\\d+)?)\\s*dBm\\b/i);
+        if (!match) return null;
+        var dbm = Number(match[1]);
+        if (!Number.isFinite(dbm) || dbm < -140 || dbm > -20) return null;
+        return Math.round(dbm);
+      }
+      function signalQuality(dbm) {
+        if (dbm === null) return null;
+        if (dbm >= -79) return { label: "极强/强", tone: "ok" };
+        if (dbm >= -89) return { label: "良好", tone: "good" };
+        if (dbm >= -99) return { label: "一般", tone: "warn" };
+        return { label: "较弱", tone: "bad" };
+      }
       function pillTone(tone) {
-        return ["ok", "bad", "warn", "muted", "info"].indexOf(tone) >= 0 ? tone : "muted";
+        return ["ok", "good", "bad", "warn", "muted", "info"].indexOf(tone) >= 0 ? tone : "muted";
       }
       function renderSimState(status) {
         var cell = panel.querySelector('[data-sim-field="sim_state"]');
@@ -59,6 +78,22 @@ def sim_status_script() -> str:
         cell.appendChild(value);
         cell.appendChild(pill);
       }
+      function renderSignal(status) {
+        var cell = panel.querySelector('[data-sim-field="signal"]');
+        if (!cell) return;
+        cell.textContent = "";
+        var value = document.createElement("span");
+        value.setAttribute("data-signal-text", "");
+        var dbm = signalDbm(status);
+        value.textContent = formatSignal(status.signal || (dbm !== null ? dbm + " dBm" : ""));
+        cell.appendChild(value);
+        var quality = signalQuality(dbm);
+        if (!quality) return;
+        var pill = document.createElement("span");
+        pill.className = "status-pill " + pillTone(quality.tone);
+        pill.textContent = quality.label;
+        cell.appendChild(pill);
+      }
       function setRefresh(active) {
         if (!refresh) return;
         refresh.disabled = active;
@@ -73,7 +108,7 @@ def sim_status_script() -> str:
         setField("sim_identity", status.sim_identity);
         setField("phone_number", status.phone_number);
         setField("sms_counts", status.sms_counts);
-        setField("signal", formatSignal(status.signal));
+        renderSignal(status);
         renderOperator(status);
         setField("checked_at", formatAdminTime(status.checked_at));
       }
@@ -170,6 +205,7 @@ def page(title: str, body: str, active: str = "") -> bytes:
     .badge.muted {{ background:#eef2f6; color:#475467; }}
     .status-pill {{ display:inline-flex; align-items:center; min-height:22px; margin-left:8px; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:800; }}
     .status-pill.ok {{ background:#dcfae6; color:var(--green); }}
+    .status-pill.good {{ background:#ecfdf3; color:#15803d; }}
     .status-pill.bad {{ background:#fee4e2; color:var(--red); }}
     .status-pill.warn {{ background:#fef0c7; color:var(--amber); }}
     .status-pill.info {{ background:#dbeafe; color:#1d4ed8; }}

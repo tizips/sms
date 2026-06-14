@@ -87,12 +87,14 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         try:
-            for index in range(SIM_STATUS_STREAM_SECONDS):
+            stream_offsets = range(0, SIM_STATUS_STREAM_SECONDS, SIM_STATUS_STREAM_INTERVAL_SECONDS)
+            stream_count = len(stream_offsets)
+            for index, _offset in enumerate(stream_offsets):
                 status = sim_status_stream_payload(get_sim_status(use_cache=False))
                 self.wfile.write(format_sse_event("sim-status", status).encode("utf-8"))
                 self.wfile.flush()
-                if index < SIM_STATUS_STREAM_SECONDS - 1:
-                    time.sleep(1)
+                if index < stream_count - 1:
+                    time.sleep(SIM_STATUS_STREAM_INTERVAL_SECONDS)
             self.wfile.write(format_sse_event("done", {"done": True}).encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

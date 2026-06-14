@@ -63,7 +63,47 @@ def sim_status_stream_payload(status: dict) -> dict:
     payload = dict(status)
     if payload.get("phone_number_e164"):
         payload["phone_number"] = payload["phone_number_e164"]
+    dbm = signal_dbm_from_status(payload)
+    label, tone = signal_quality_for_dbm(dbm)
+    if dbm is not None:
+        payload["signal_dbm"] = dbm
+        payload["signal_quality"] = label
+        payload["signal_quality_tone"] = tone
+    else:
+        payload.setdefault("signal_dbm", "")
+        payload.setdefault("signal_quality", "")
+        payload.setdefault("signal_quality_tone", "")
     return payload
+
+
+PVE_STATIC_STATUS_FIELDS = ("sim_identity", "phone_number", "country_code", "phone_number_e164", "iccid", "operator")
+PVE_STATIC_STATUS_CACHE: dict[str, str] = {}
+
+
+def update_pve_static_status_cache(status: dict) -> None:
+    if status.get("error"):
+        return
+    if str(status.get("sim_state") or "").startswith("未识别"):
+        PVE_STATIC_STATUS_CACHE.clear()
+        return
+    values = {field: str(status.get(field) or "") for field in PVE_STATIC_STATUS_FIELDS}
+    if not any(values.values()):
+        return
+    cached_identity = PVE_STATIC_STATUS_CACHE.get("sim_identity", "")
+    new_identity = values.get("sim_identity", "")
+    if cached_identity and new_identity and cached_identity != new_identity:
+        PVE_STATIC_STATUS_CACHE.clear()
+    PVE_STATIC_STATUS_CACHE.update({field: value for field, value in values.items() if value})
+
+
+def apply_pve_static_status_cache(status: dict) -> dict:
+    if not PVE_STATIC_STATUS_CACHE:
+        return status
+    merged = dict(status)
+    for field, value in PVE_STATIC_STATUS_CACHE.items():
+        if value and not merged.get(field):
+            merged[field] = value
+    return merged
 
 
 def estimate_segments(text: str) -> tuple[int, str]:
@@ -212,15 +252,16 @@ def parse_smsd_monitor_output(output: str) -> dict:
         key, value = raw.split(":", 1)
         values[key.strip().lower()] = value.strip()
 
-    signal = values.get("networksignal", "")
-    if signal in {"-1", "255"}:
-        signal = ""
+    monitor_signal = values.get("networksignal", "")
+    signal_dbm = monitor_signal_percent_to_dbm(monitor_signal)
+    signal = f"{signal_dbm} dBm" if signal_dbm is not None else ""
     battery = values.get("batterpercent", "")
     imsi = values.get("imsi", "")
     operator = values.get("netname", "") or values.get("netcode", "")
     sms_counts = format_sms_counts(values.get("sent", ""), values.get("received", ""), values.get("failed", ""))
     network_state = "smsd 运行中" if values else ""
-    switch, switch_tone = describe_network_switch(signal, f"{signal}%" if signal else "", network_state)
+    network_level = f"{monitor_signal}%" if signal_dbm is not None else ""
+    switch, switch_tone = describe_network_switch(signal, network_level, network_state)
     sim_state = describe_sim_state(imsi, bool(values))
     return {
         "sim_state": sim_state,
@@ -229,7 +270,8 @@ def parse_smsd_monitor_output(output: str) -> dict:
         "phone_number": "",
         "sms_counts": sms_counts,
         "signal": signal,
-        "network_level": f"{signal}%" if signal else "",
+        "signal_dbm": signal_dbm if signal_dbm is not None else "",
+        "network_level": network_level,
         "network_state": network_state,
         "network_switch": switch,
         "network_switch_tone": switch_tone,
@@ -315,6 +357,9 @@ def read_smsd_monitor_status() -> dict | None:
 
 def pve_radio_agent_url() -> str:
     return os.environ.get("PVE_RADIO_AGENT_URL", "").strip().rstrip("/")
+
+
+PVE_AGENT_TIMEOUT_SECONDS = float(os.environ.get("PVE_AGENT_TIMEOUT_SECONDS", "8"))
 
 
 def sms_redis_url() -> str:
@@ -415,16 +460,20 @@ def read_pve_agent_sim_status() -> dict | None:
         return None
     request = urllib.request.Request(f"{base_url}/sim/status", headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=3) as response:
+        with urllib.request.urlopen(request, timeout=PVE_AGENT_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
-        return {
+        return apply_pve_static_status_cache({
             "sim_state": "状态不可用（PVE Agent 通信失败）",
             "sim_state_tone": "bad",
             "sim_identity": "",
             "phone_number": "",
+            "country_code": "",
+            "phone_number_e164": "",
+            "iccid": "",
             "sms_counts": "",
             "signal": "",
+            "signal_dbm": "",
             "network_level": "",
             "network_state": "",
             "network_switch": "数据关闭",
@@ -434,7 +483,7 @@ def read_pve_agent_sim_status() -> dict | None:
             "error": str(exc)[:300],
             "source_updated_at": "",
             "checked_at": now_text(),
-        }
+        })
     defaults = {
         "sim_state": "状态未知",
         "sim_state_tone": "muted",
@@ -442,6 +491,7 @@ def read_pve_agent_sim_status() -> dict | None:
         "phone_number": "",
         "sms_counts": "",
         "signal": "",
+        "signal_dbm": "",
         "network_level": "",
         "network_state": payload.get("registration_state", ""),
         "network_switch": "数据关闭",
@@ -455,11 +505,12 @@ def read_pve_agent_sim_status() -> dict | None:
     defaults.update({key: value for key, value in payload.items() if value is not None})
     defaults["network_switch"] = "数据关闭"
     defaults["network_switch_tone"] = "ok" if defaults.get("wwan_state") in {"", "DOWN"} else "warn"
+    update_pve_static_status_cache(defaults)
     return defaults
 
 
 def render_status_pill(label: str, tone: str = "muted") -> str:
-    safe_tone = tone if tone in {"ok", "bad", "warn", "muted", "info"} else "muted"
+    safe_tone = tone if tone in {"ok", "good", "bad", "warn", "muted", "info"} else "muted"
     return f'<span class="status-pill {safe_tone}">{html.escape(label or "未知")}</span>'
 
 
@@ -474,8 +525,20 @@ def render_operator_value(status: dict) -> str:
     return f'<span data-operator-text>{operator}</span>{pill}'
 
 
+def render_signal_value(status: dict) -> str:
+    dbm = signal_dbm_from_status(status)
+    raw_signal = status.get("signal")
+    if dbm is not None and not raw_signal:
+        raw_signal = f"{dbm} dBm"
+    signal = html.escape(format_signal_strength(raw_signal))
+    label, tone = signal_quality_for_dbm(dbm)
+    if not label:
+        return f'<span data-signal-text>{signal}</span>'
+    return f'<span data-signal-text>{signal}</span>{render_status_pill(label, tone)}'
+
+
 def render_sim_state_value(label: str, tone: str) -> str:
-    safe_tone = tone if tone in {"ok", "bad", "warn", "muted", "info"} else "muted"
+    safe_tone = tone if tone in {"ok", "good", "bad", "warn", "muted", "info"} else "muted"
     escaped = html.escape(label)
     return f'<span class="status-pill {safe_tone}" data-sim-badge>{escaped}</span>'
 
@@ -538,7 +601,7 @@ def render_sim_status_panel() -> str:
         ("sim_identity", "SIM 标识", html.escape(str(status.get("sim_identity") or "-"))),
         ("phone_number", "手机号", html.escape(str(status.get("phone_number") or "-"))),
         ("sms_counts", "短信计数", html.escape(str(status.get("sms_counts") or "-"))),
-        ("signal", "信号强度", html.escape(format_signal_strength(status.get("signal")))),
+        ("signal", "信号强度", render_signal_value(status)),
         ("operator", "运营商", render_operator_value(status)),
         ("checked_at", "检测时间", html.escape(format_admin_time(status.get("checked_at")))),
     ]

@@ -123,6 +123,33 @@ def force_wwan_down() -> None:
         log(f"wwan0_down_check_error={exc}")
 
 
+def enable_mbim_radio() -> None:
+    try:
+        result = subprocess.run(
+            ["mbimcli", "-p", "-d", MBIM_DEV, "--set-radio-state=on"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as exc:
+        log(f"mbim_radio_on_error={exc}")
+        return
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode == 0:
+        log("mbim software radio requested on")
+    else:
+        log(f"mbim_radio_on_exit={result.returncode} output={output[:300]!r}")
+
+
+def ensure_full_functionality() -> None:
+    with RadioLock():
+        state = at_command("AT+CFUN?", timeout=5)
+        if "+CFUN: 1" in state:
+            return
+        output = at_command("AT+CFUN=1", timeout=20)
+        log(f"cfun_enable_output={output[:300]!r}")
+
+
 def recover_sim() -> None:
     subprocess.run(["systemctl", "stop", "gammu-smsd.service"], capture_output=True, text=True, timeout=20)
     with RadioLock():
@@ -130,8 +157,11 @@ def recover_sim() -> None:
         at_command("AT+CFUN=0", timeout=5)
         time.sleep(8)
         at_command("AT+CFUN=1", timeout=8)
-    time.sleep(12)
-    subprocess.run(["systemctl", "start", "quectel-radio-unlock.service"], capture_output=True, text=True, timeout=20)
+    time.sleep(6)
+    subprocess.run(["systemctl", "restart", "quectel-radio-unlock.service"], capture_output=True, text=True, timeout=20)
+    enable_mbim_radio()
+    time.sleep(8)
+    ensure_full_functionality()
     subprocess.run(["systemctl", "start", "gammu-smsd.service"], capture_output=True, text=True, timeout=20)
     force_wwan_down()
     ready, details = sim_is_ready()

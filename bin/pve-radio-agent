@@ -30,6 +30,9 @@ SMSD_HEALTH_LOG_MINUTES = int(os.environ.get("PVE_RADIO_SMSD_HEALTH_LOG_MINUTES"
 SEND_TIMEOUT_SECONDS = int(os.environ.get("PVE_RADIO_SEND_TIMEOUT_SECONDS", "90"))
 SENT_WAIT_SECONDS = float(os.environ.get("PVE_RADIO_SENT_WAIT_SECONDS", "45"))
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S %z"
+STATIC_SIM_FIELDS = ("sim_identity", "phone_number", "country_code", "phone_number_e164", "iccid", "operator")
+STATIC_SIM_CACHE: dict[str, str] = {}
+STATIC_SIM_CACHE_LOCK = threading.Lock()
 
 
 def configured_smsd_path(option: str, default: str) -> Path:
@@ -153,6 +156,45 @@ def format_phone_number_e164(phone_number: str = "", country_code: str = "") -> 
     return f"+{code} - {local}" if local else ""
 
 
+def static_sim_cache_snapshot() -> dict:
+    with STATIC_SIM_CACHE_LOCK:
+        return dict(STATIC_SIM_CACHE)
+
+
+def clear_static_sim_cache() -> None:
+    with STATIC_SIM_CACHE_LOCK:
+        STATIC_SIM_CACHE.clear()
+
+
+def cache_static_sim_fields(status: dict) -> None:
+    if not str(status.get("sim_state") or "").startswith("已识别"):
+        return
+    values = {field: str(status.get(field) or "") for field in STATIC_SIM_FIELDS}
+    if not any(values.values()):
+        return
+    with STATIC_SIM_CACHE_LOCK:
+        cached_identity = STATIC_SIM_CACHE.get("sim_identity", "")
+        new_identity = values.get("sim_identity", "")
+        if cached_identity and new_identity and cached_identity != new_identity:
+            STATIC_SIM_CACHE.clear()
+        STATIC_SIM_CACHE.update({key: value for key, value in values.items() if value})
+
+
+def apply_static_sim_cache(status: dict) -> None:
+    if status.get("error") or str(status.get("sim_state") or "").startswith("未识别"):
+        return
+    cached = static_sim_cache_snapshot()
+    if not cached:
+        return
+    cached_identity = cached.get("sim_identity", "")
+    current_identity = str(status.get("sim_identity") or "")
+    if cached_identity and current_identity and cached_identity != current_identity:
+        return
+    for field, value in cached.items():
+        if value and not status.get(field):
+            status[field] = value
+
+
 def parse_mbim_number_info(output: str) -> tuple[str, str, str]:
     phone_number = parse_mbim_phone_number(output)
     country_code = infer_country_code_from_phone_number(phone_number) or parse_mbim_country_code(output)
@@ -214,6 +256,42 @@ def format_sms_counts(sent: str = "", received: str = "", failed: str = "") -> s
     return f"已发 {sent or '0'} / 已收 {received or '0'} / 失败 {failed or '0'}"
 
 
+def csq_rssi_to_dbm(value: str = "") -> int | None:
+    try:
+        rssi = int(str(value).strip())
+    except Exception:
+        return None
+    if rssi == 99 or rssi < 0 or rssi > 31:
+        return None
+    return -113 + (2 * rssi)
+
+
+def monitor_signal_percent_to_dbm(value: str = "") -> int | None:
+    text = str(value or "").strip().rstrip("%")
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return None
+    percent = int(round(float(text)))
+    if percent <= 0 or percent > 100 or percent == 255:
+        return None
+    rssi = int((percent * 31 + 50) // 100)
+    return csq_rssi_to_dbm(str(rssi))
+
+
+def parse_at_csq_dbm(output: str) -> int | None:
+    match = re.search(r"\+CSQ:\s*(\d+)\s*,", output or "")
+    return csq_rssi_to_dbm(match.group(1)) if match else None
+
+
+def read_at_signal_dbm() -> int | None:
+    try:
+        with RadioLock(), ATSession() as at:
+            at.command("AT", timeout=1)
+            at.command("ATE0", timeout=1)
+            return parse_at_csq_dbm(at.command("AT+CSQ", timeout=2))
+    except Exception:
+        return None
+
+
 def describe_sim_state(imsi: str = "", has_status: bool = False) -> str:
     if imsi:
         return "已识别（IMSI 可用）"
@@ -230,9 +308,9 @@ def parse_smsd_monitor_output(output: str) -> dict:
         key, value = raw.split(":", 1)
         values[key.strip().lower()] = value.strip()
 
-    signal = values.get("networksignal", "")
-    if signal in {"-1", "99", "255"}:
-        signal = ""
+    monitor_signal = values.get("networksignal", "")
+    signal_dbm = monitor_signal_percent_to_dbm(monitor_signal)
+    signal = f"{signal_dbm} dBm" if signal_dbm is not None else ""
     imsi = values.get("imsi", "")
     operator = values.get("netname", "") or infer_operator(values.get("netcode", ""), imsi) or values.get("netcode", "")
     sim_state = describe_sim_state(imsi, bool(values))
@@ -246,7 +324,8 @@ def parse_smsd_monitor_output(output: str) -> dict:
         "iccid": "",
         "operator": operator,
         "signal": signal,
-        "network_level": "",
+        "signal_dbm": signal_dbm if signal_dbm is not None else "",
+        "network_level": f"{monitor_signal}%" if signal_dbm is not None else "",
         "registration_state": "smsd 运行中" if values else "",
         "network_state": "smsd 运行中" if values else "",
         "sms_counts": format_sms_counts(values.get("sent", ""), values.get("received", ""), values.get("failed", "")),
@@ -266,6 +345,7 @@ def sim_problem_status(sim_state: str, network_state: str, error: str = "") -> d
         "iccid": "",
         "operator": "",
         "signal": "",
+        "signal_dbm": "",
         "network_level": "",
         "registration_state": network_state,
         "network_state": network_state,
@@ -330,6 +410,9 @@ def read_wwan_state() -> str:
 
 
 def attach_wwan_status(status: dict) -> dict:
+    if status.get("error") and "无法访问 SIM 卡" in str(status.get("error")):
+        clear_static_sim_cache()
+    apply_static_sim_cache(status)
     wwan_state = read_wwan_state()
     phone_number = str(status.get("phone_number") or "")
     country_code = str(status.get("country_code") or "")
@@ -339,6 +422,11 @@ def attach_wwan_status(status: dict) -> dict:
         phone_number = phone_number or mbim_phone_number
         country_code = country_code or mbim_country_code
         phone_number_e164 = phone_number_e164 or mbim_phone_number_e164
+    if status.get("signal_dbm") in {"", None}:
+        signal_dbm = read_at_signal_dbm()
+        if signal_dbm is not None:
+            status["signal"] = f"{signal_dbm} dBm"
+            status["signal_dbm"] = signal_dbm
     status.update(
         {
             "network_switch": "数据关闭",
@@ -350,6 +438,7 @@ def attach_wwan_status(status: dict) -> dict:
             "checked_at": now_text(),
         }
     )
+    cache_static_sim_fields(status)
     return status
 
 
